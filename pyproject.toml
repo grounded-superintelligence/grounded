@@ -1,0 +1,52 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "grounded"
+version = "0.0.0"
+description = "GSI SDK"
+authors = [
+  { name="Vincent Liu", email="vincent@gsi.company" }
+]
+requires-python = ">=3.10"
+dependencies = [
+    "numpy>2",
+    "opencv-python",
+    "boto3",
+    "botocore[crt]",
+    "tqdm",
+]
+
+[project.optional-dependencies]
+dev = [
+    "boto3-stubs[s3]",
+    "pre-commit",
+    "ruff",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["grounded*"]
+exclude = ["admin"]
+
+[tool.ruff]
+indent-width = 4
+line-length = 127
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I"]
+ignore = ["E722", "E741"]
+
+[tool.ruff.lint.isort]
+combine-as-imports = true
+from-first = false
+known-first-party = ["src"]
+
+[tool.ruff.format]
+docstring-code-format = true
+indent-style = "space"
+line-ending = "auto"
+quote-style = "double"
+skip-magic-trailing-comma = false
