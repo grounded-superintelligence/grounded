@@ -3,16 +3,16 @@
 / _____/ |  __ \  /  __  \ | |  | | | \  | | | ___ \  |  ____| | ___ \         
 | |__  | | |__) | | (__) | | |__| | |  \ | | | |__) | |  ___|  | |__) |        
 \______/ |_|  \_\ \______/  \____/  |_|  \_| |_____/  |______| |_____/        
-                                                                            
- ______  _    _   ______   ______   _____    ______   _    _   ______   ______ 
-/ ____/ | |  | | |  ___ \ |  ____| |  __ \  |__  __| | \  | | |__  __| |  ____|
-\____ \ | |__| | | |__/ / |  ___|  | |__) |   |  |   |  \ | |   |  |   |  ___| 
-/_____/  \____/  | |      |______| |_|  \_\ |______| |_|  \_|   |__|   |______|
-                                                                        
-         _        _        ______   ______   ______   _    _   ______   ______ 
-        | |      | |      |__  __| / _____/ |  ____| | \  | | / _____/ |  ____|
-        | |____  | |____    |  |   | |__  | |  ___|  |  \ | | | |____  |  ___| 
-        |______| |______| |______| \______/ |______| |_|  \_| \______\ |______|
+
+ _______  _    _   ______   ______   _____    ______   _    _   ______   ______ 
+/ _____/ | |  | | |  ___ \ |  ____| |  __ \  |__  __| | \  | | |__  __| |  ____|
+\_____ \ | |__| | | |__/ / |  ___|  | |__) |   |  |   |  \ | |   |  |   |  ___| 
+/______/  \____/  | |      |______| |_|  \_\ |______| |_|  \_|   |__|   |______|
+
+          _        _        ______   ______   ______   _    _   ______   ______ 
+         | |      | |      |__  __| / _____/ |  ____| | \  | | / _____/ |  ____|
+         | |____  | |____    |  |   | |__  | |  ___|  |  \ | | | |____  |  ___| 
+         |______| |______| |______| \______/ |______| |_|  \_| \______\ |______|
 ```
 
 ## setup
@@ -42,17 +42,11 @@ from grounded.data.visualize import visualize_episode_to_mp4
 
 # initialize dataset
 # you target_dir defaults to your cache, so make sure to change this for each dataset
-dataset = EgoDataset(
-    "index.json",
-    aws_profile="grounded",
-    target_dir="~/.cache/grounded/data",
-    active_cameras=["left-front", "right-front"],
-)
+dataset = EgoDataset("index.json", aws_profile="grounded", active_cameras=["left-front", "right-front"], min_duration_sec=2)
 print(f"Found {len(dataset)} episodes")
 
 # initialize episode
-dataset.download_episode(0)
-episode: EgoEpisode = dataset[0]
+episode: EgoEpisode = dataset[0]  # this will download it internally if it's missing
 
 # visualize episode
 visualize_episode_to_mp4(episode, downsample=4, fps=30, output_path="test.mp4")

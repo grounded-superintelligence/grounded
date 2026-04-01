@@ -1,10 +1,11 @@
 import json
 import os
+import posixpath
 import subprocess
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Optional
 from urllib.parse import urlparse
 
 import cv2
@@ -29,14 +30,19 @@ class FrameData:
 
 
 class PathManager:
-    def __init__(self, rectified_data_dir: str):
-        self.rectified_data_dir = rectified_data_dir
-        self.left_front_mp4 = os.path.join(rectified_data_dir, "left-front.mp4")
-        self.right_front_mp4 = os.path.join(rectified_data_dir, "right-front.mp4")
-        self.stereo_params_npz = os.path.join(rectified_data_dir, "stereo_params.npz")
-        self.timestamps_txt = os.path.join(rectified_data_dir, "timestamp.txt")
-        self.processed_dir = os.path.join(rectified_data_dir, "..")
-        self.hand_pose_dir = os.path.join(self.processed_dir, "hand_tracking", "poses", "refined", "params")
+    def __init__(self, rectified_dir: str):
+        # .../processed-segmentXX/hand/
+        hand_dir = posixpath.dirname(rectified_dir)
+        # .../processed-segmentXX/
+        processed_dir = posixpath.dirname(hand_dir)
+
+        # Define synchronized sub-paths
+        self.hand_pose_dir = posixpath.join(hand_dir, "hand_tracking", "poses", "refined", "params")
+        self.slam_trajectory_txt = posixpath.join(processed_dir, "slam", "mav0", "pycuvslam_trajectory.txt")
+        self.left_front_mp4 = posixpath.join(rectified_dir, "left-front.mp4")
+        self.right_front_mp4 = posixpath.join(rectified_dir, "right-front.mp4")
+        self.stereo_params_npz = posixpath.join(rectified_dir, "stereo_params.npz")
+        self.timestamp_txt = posixpath.join(rectified_dir, "timestamp.txt")
 
 
 class EgoEpisode:
@@ -45,20 +51,20 @@ class EgoEpisode:
     def __init__(
         self,
         rectified_data_dir: str,
-        stereo_params: Dict[str, np.ndarray],
         start_frame: int,
         end_frame: int,
         active_cameras: list[str],
-        trajectory_uri: str = None,
     ):
         self.rectified_data_dir = rectified_data_dir
         self.path_manager = PathManager(rectified_data_dir)
         self.start_frame = start_frame
         self.end_frame = end_frame
         self.active_cameras = active_cameras
-        self.stereo_params = stereo_params
 
-        with open(self.path_manager.timestamps_txt, "r") as f:
+        stereo_npz = np.load(self.path_manager.stereo_params_npz, allow_pickle=True)
+        self.stereo_params = {key: stereo_npz[key] for key in stereo_npz.files}
+
+        with open(self.path_manager.timestamp_txt, "r") as f:
             self.timestamps = f.read().strip().split("\n")
 
         # State for VideoCapture objects
@@ -69,17 +75,15 @@ class EgoEpisode:
         self.c2w_timestamps = np.array([])
         self.c2w_poses = np.array([])
 
-        if trajectory_uri and os.path.exists(trajectory_uri):
-            traj_data = np.loadtxt(trajectory_uri, comments="#")
-            if traj_data.ndim == 1:
-                traj_data = traj_data[np.newaxis, :]
+        traj_data = np.loadtxt(self.path_manager.slam_trajectory_txt, comments="#")
+        if traj_data.ndim == 1:
+            traj_data = traj_data[np.newaxis, :]
 
-            # Note: based on your data, trajectory is in seconds.
-            # Convert trajectory timestamps to nanoseconds.
-            self.c2w_timestamps = (traj_data[:, 0] * 1e9).astype(np.int64)
-            self.c2w_poses = traj_data[:, 1:]
-
-            self._compute_and_print_max_delta()
+        # Note: based on your data, trajectory is in seconds.
+        # Convert trajectory timestamps to nanoseconds.
+        self.c2w_timestamps = (traj_data[:, 0] * 1e9).astype(np.int64)
+        self.c2w_poses = traj_data[:, 1:]
+        self._compute_and_print_max_delta()
 
     def _compute_and_print_max_delta(self):
         max_delta_ns = 0
@@ -164,6 +168,8 @@ class EgoDataset:
         active_cameras: list[str] = None,
         aws_profile: str = None,
         target_dir: str = GROUNDED_DIR_DEFAULT,
+        min_duration_sec: float = 1.0,
+        fps: float = 30.0,
     ):
         self.index_path = Path(index_path).expanduser()
         self.aws_profile = aws_profile
@@ -177,50 +183,101 @@ class EgoDataset:
             data = json.load(f)
 
         self.metadata = data.get("metadata", {})
-        self.index = list(data.get("index", {}).values())
-        self.unique_uris = [episode["perception_uri"] for episode in self.index]
-        print(f"Loaded dataset index with {len(self.index)} episodes.")
+        raw_index = list(data.get("index", {}).values())
 
-    def _validate_episode_dir(self, rectified_data_dir: Path) -> bool:
-        required = [rectified_data_dir / "timestamp.txt", rectified_data_dir / "stereo_params.npz"]
-        for cam in self.active_cameras:
-            required.append(rectified_data_dir / f"{cam}.mp4")
-        return all(p.exists() for p in required)
+        # Attempt to get fps from metadata, fallback to the provided init parameter
+        dataset_fps = self.metadata.get("fps", fps)
+
+        self.index = []
+        total_frames = 0
+
+        # Filter episodes by minimum duration
+        for episode in raw_index:
+            frame_count = episode["frame_end"] - episode["frame_start"]
+            duration_sec = frame_count / dataset_fps
+
+            if duration_sec >= min_duration_sec:
+                self.index.append(episode)
+                total_frames += frame_count
+
+        total_duration_sec = total_frames / dataset_fps
+        self.unique_uris = [episode["perception_uri"] for episode in self.index]
+
+        print(f"Loaded dataset index with {len(self.index)} episodes (min duration threshold: {min_duration_sec}s).")
+        print(f"Total dataset duration: {total_duration_sec:.2f} seconds ({total_frames} frames at {dataset_fps} FPS).")
+
+    def _validate_episode_dir(self, path_manager: PathManager) -> bool:
+        required = [
+            path_manager.timestamp_txt,
+            path_manager.stereo_params_npz,
+            path_manager.slam_trajectory_txt,
+            path_manager.hand_pose_dir,
+        ]
+        if "left-front" in self.active_cameras:
+            required.append(path_manager.left_front_mp4)
+        if "right-front" in self.active_cameras:
+            required.append(path_manager.right_front_mp4)
+        return all(os.path.exists(p) for p in required)
 
     def download_episode(self, episode_idx: int, s3_concurrency: int = 10) -> str:
-        episode_uri = self.unique_uris[episode_idx]
-        if not episode_uri.startswith("s3://"):
-            local_path = Path(episode_uri).parent
-            if not self._validate_episode_dir(local_path):
-                raise ValueError(f"Local episode {local_path} is missing required files.")
-            return str(local_path)
+        episode_uri = self.unique_uris[episode_idx]  # s3://.../hand/rectified_dataset/timestamp.txt
 
-        parsed = urlparse(episode_uri)
-        bucket = parsed.netloc
-        s3_dir_key = str(Path(parsed.path.lstrip("/")).parent).replace("\\", "/")
-        s3_target_dir = f"s3://{bucket}/{s3_dir_key}"
-        local_cache_dir = self.target_dir / bucket / s3_dir_key
+        if episode_uri.startswith("s3://"):
+            parsed = urlparse(episode_uri)
+            bucket = parsed.netloc
 
-        if local_cache_dir.exists() and self._validate_episode_dir(local_cache_dir):
-            return str(local_cache_dir)
+            # 1. Identify the 'rectified_dataset' directory as the root for PathManager
+            s3_rectified_key = posixpath.dirname(parsed.path.lstrip("/"))
+            s3_rectified_data_dir = f"s3://{bucket}/{s3_rectified_key}"
 
-        local_cache_dir.mkdir(parents=True, exist_ok=True)
-        cmd = ["aws", "s3", "sync", s3_target_dir, str(local_cache_dir)]
-        if self.aws_profile:
-            cmd.extend(["--profile", self.aws_profile])
+            # 2. Local root mirror
+            local_rectified_data_dir = str(self.target_dir / bucket / s3_rectified_key)
 
-        env = os.environ.copy()
-        env["AWS_MAX_CONCURRENT_REQUESTS"] = str(s3_concurrency)
+            # 3. Apply PathManager to both (Recycling logic)
+            s3_paths = PathManager(s3_rectified_data_dir)
+            local_paths = PathManager(local_rectified_data_dir)
 
-        try:
-            subprocess.run(cmd, check=True, capture_output=True, text=True, env=env)
-        except subprocess.CalledProcessError as e:
-            raise RuntimeError(f"Failed to download {s3_target_dir}. Error: {e.stderr}") from e
+            # Ensure local directories exist
+            os.makedirs(local_rectified_data_dir, exist_ok=True)
+            os.makedirs(local_paths.hand_pose_dir, exist_ok=True)
 
-        if not self._validate_episode_dir(local_cache_dir):
-            raise ValueError(f"Downloaded episode {local_cache_dir} is missing required files.")
+            env = os.environ.copy()
+            env["AWS_MAX_CONCURRENT_REQUESTS"] = str(s3_concurrency)
 
-        return str(local_cache_dir)
+            # 1. Download specific files inside rectified_data_dir (cp)
+            files_to_download = [
+                (s3_paths.timestamp_txt, local_paths.timestamp_txt),
+                (s3_paths.stereo_params_npz, local_paths.stereo_params_npz),
+                (s3_paths.slam_trajectory_txt, local_paths.slam_trajectory_txt),
+            ]
+            if "left-front" in self.active_cameras:
+                files_to_download.append((s3_paths.left_front_mp4, local_paths.left_front_mp4))
+            if "right-front" in self.active_cameras:
+                files_to_download.append((s3_paths.right_front_mp4, local_paths.right_front_mp4))
+
+            for s3_src, local_dst in files_to_download:
+                if not os.path.exists(local_dst):
+                    cmd = ["aws", "s3", "cp", s3_src, local_dst]
+                    if self.aws_profile:
+                        cmd.extend(["--profile", self.aws_profile])
+                    subprocess.run(cmd, check=True, capture_output=True, text=True, env=env)
+
+            # 2. Download the hand pose directory (sync)
+            # Using sync because this directory contains multiple frame_XXXXXX.npz files
+            if not os.listdir(local_paths.hand_pose_dir):
+                cmd = ["aws", "s3", "sync", s3_paths.hand_pose_dir, local_paths.hand_pose_dir]
+                if self.aws_profile:
+                    cmd.extend(["--profile", self.aws_profile])
+                subprocess.run(cmd, check=True, capture_output=True, text=True, env=env)
+
+        else:
+            local_rectified_data_dir = os.path.abspath(os.path.dirname(episode_uri))
+            local_paths = PathManager(local_rectified_data_dir)
+
+        if not self._validate_episode_dir(local_paths):
+            raise ValueError(f"Downloaded episode {local_rectified_data_dir} is missing required files.")
+
+        return local_rectified_data_dir
 
     def download_dataset(self, max_workers: int = 4):
         print(f"Starting parallel download with {max_workers} workers...")
@@ -239,21 +296,14 @@ class EgoDataset:
 
     def __getitem__(self, idx) -> EgoEpisode:
         episode_info = self.index[idx]
-        perception_uri = episode_info["perception_uri"]
-        trajectory_uri = episode_info.get("trajectory_uri")
-        local_dir = self.download_episode(idx)
 
-        stereo_npz = np.load(
-            os.path.join(os.path.dirname(perception_uri), "stereo_params.npz"),
-            allow_pickle=True,
-        )
-        stereo_params = {key: stereo_npz[key] for key in stereo_npz.files}
+        # Download files and get the local path
+        local_rectified_dir = self.download_episode(idx)
 
+        # Pass the local directory to EgoEpisode
         return EgoEpisode(
-            rectified_data_dir=local_dir,
-            stereo_params=stereo_params,
+            rectified_data_dir=local_rectified_dir,
             start_frame=episode_info["frame_start"],
             end_frame=episode_info["frame_end"],
             active_cameras=self.active_cameras,
-            trajectory_uri=trajectory_uri,
         )
