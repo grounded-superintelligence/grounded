@@ -1,13 +1,10 @@
-"""
-Dataset interface for GSI labeled data
-"""
-
 import json
 import os
 import subprocess
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Dict, Optional
 from urllib.parse import urlparse
 
 import cv2
@@ -21,91 +18,157 @@ GROUNDED_DIR_DEFAULT = os.path.expanduser("~/.cache/grounded/data/")
 class FrameData:
     """Dataclass holding all synchronized data for a single frame."""
 
-    timestamp: float
-    front_img: np.ndarray
-    eye_img: np.ndarray
-    left_kps_front: np.ndarray
-    right_kps_front: np.ndarray
-    left_kps_eye: np.ndarray
-    right_kps_eye: np.ndarray
+    timestamp_ns: str
+    left_front_img: np.ndarray | None
+    right_front_img: np.ndarray | None
     stereo_params: dict
+    left_hand_3d: np.ndarray
+    right_hand_3d: np.ndarray
+    c2w_pose: Optional[np.ndarray]  # [tx, ty, tz, qx, qy, qz, qw]
+    caption: str = None  # TODO: add patch for this
+
+
+class PathManager:
+    def __init__(self, rectified_data_dir: str):
+        self.rectified_data_dir = rectified_data_dir
+        self.left_front_mp4 = os.path.join(rectified_data_dir, "left-front.mp4")
+        self.right_front_mp4 = os.path.join(rectified_data_dir, "right-front.mp4")
+        self.stereo_params_npz = os.path.join(rectified_data_dir, "stereo_params.npz")
+        self.timestamps_txt = os.path.join(rectified_data_dir, "timestamp.txt")
+        self.processed_dir = os.path.join(rectified_data_dir, "..")
+        self.hand_pose_dir = os.path.join(self.processed_dir, "hand_tracking", "poses", "refined", "params")
 
 
 class EgoEpisode:
-    """A lazy-loaded, sliceable representation of a single demonstration."""
+    """A lazy-loaded, sliceable representation of a single demonstration interval."""
 
-    def __init__(self, demo_dir: str):
-        self.demo_dir = Path(demo_dir)
-        self.front_dir = self.demo_dir / "left-front"
-        self.eye_dir = self.demo_dir / "left-eye"
+    def __init__(
+        self,
+        rectified_data_dir: str,
+        stereo_params: Dict[str, np.ndarray],
+        start_frame: int,
+        end_frame: int,
+        active_cameras: list[str],
+        trajectory_uri: str = None,
+    ):
+        self.rectified_data_dir = rectified_data_dir
+        self.path_manager = PathManager(rectified_data_dir)
+        self.start_frame = start_frame
+        self.end_frame = end_frame
+        self.active_cameras = active_cameras
+        self.stereo_params = stereo_params
 
-        # Load Stereo Params (Strictly required per constraints)
-        stereo_path = self.demo_dir / "stereo_params.npz"
-        if not stereo_path.exists():
-            raise FileNotFoundError(f"Missing mandatory stereo_params.npz in {self.demo_dir}")
+        with open(self.path_manager.timestamps_txt, "r") as f:
+            self.timestamps = f.read().strip().split("\n")
 
-        # Load all keys from stereo rectify into a dict
-        stereo_npz = np.load(stereo_path, allow_pickle=True)
-        self.stereo_params = {key: stereo_npz[key] for key in stereo_npz.files}
+        # State for VideoCapture objects
+        self._caps = {}
+        self._last_read_idx = {cam: -1 for cam in self.active_cameras}
 
-        # Load data.npz
-        data_path = self.demo_dir / "data.npz"
-        if not data_path.exists():
-            raise FileNotFoundError(f"Missing mandatory data.npz in {self.demo_dir}")
+        # Load Trajectory Data
+        self.c2w_timestamps = np.array([])
+        self.c2w_poses = np.array([])
 
-        data_npz = np.load(data_path, allow_pickle=True)
-        self.data_dict = data_npz["data"].item()
-        self.timestamps = self.data_dict.get("timestamps", [])
+        if trajectory_uri and os.path.exists(trajectory_uri):
+            traj_data = np.loadtxt(trajectory_uri, comments="#")
+            if traj_data.ndim == 1:
+                traj_data = traj_data[np.newaxis, :]
 
-        # Discover and align image frames
-        front_imgs = sorted([f for f in os.listdir(self.front_dir) if f.endswith((".jpg", ".png"))])
-        eye_imgs = sorted([f for f in os.listdir(self.eye_dir) if f.endswith((".jpg", ".png"))])
-        self.common_frames = sorted(list(set(front_imgs).intersection(set(eye_imgs))))
+            # Note: based on your data, trajectory is in seconds.
+            # Convert trajectory timestamps to nanoseconds.
+            self.c2w_timestamps = (traj_data[:, 0] * 1e9).astype(np.int64)
+            self.c2w_poses = traj_data[:, 1:]
 
-        if not self.common_frames:
-            raise ValueError(f"No matching frames found between cameras in {self.demo_dir}")
+            self._compute_and_print_max_delta()
+
+    def _compute_and_print_max_delta(self):
+        max_delta_ns = 0
+        for i in range(self.start_frame, self.end_frame):
+            if i < len(self.timestamps):
+                frame_ts_ns = int(self.timestamps[i])
+                closest_idx = np.abs(self.c2w_timestamps - frame_ts_ns).argmin()
+                delta = abs(self.c2w_timestamps[closest_idx] - frame_ts_ns)
+                if delta > max_delta_ns:
+                    max_delta_ns = delta
+
+        # Print the max delta in ms for easier reading
+        print(f"Max timestamp delta (rgb/slam) for frames [{self.start_frame}-{self.end_frame}]: {max_delta_ns / 1e6:.3f} ms")
+
+    def _get_cap(self, cam_name: str):
+        if cam_name not in self._caps:
+            vid_path = os.path.join(self.rectified_data_dir, f"{cam_name}.mp4")
+            if not os.path.exists(vid_path):
+                raise FileNotFoundError(f"Missing video: {vid_path}")
+            self._caps[cam_name] = cv2.VideoCapture(vid_path)
+        return self._caps[cam_name]
+
+    def _load_and_merge_hand_streams(self, global_frame: int):
+        with np.load(
+            os.path.join(self.path_manager.hand_pose_dir, f"frame_{global_frame:06d}.npz"),
+            allow_pickle=True,
+        ) as hand_pose_data:
+            l_front = hand_pose_data["left"].item()["front"]["keypoints_3d_rectcam"]
+            r_front = hand_pose_data["right"].item()["front"]["keypoints_3d_rectcam"]
+
+        return l_front, r_front
 
     def __len__(self):
-        return len(self.common_frames)
+        return self.end_frame - self.start_frame
 
     def __getitem__(self, idx) -> FrameData:
-        # Handle standard slicing
         if isinstance(idx, slice):
             return [self.__getitem__(i) for i in range(*idx.indices(len(self)))]
 
-        frame_name = self.common_frames[idx]
+        global_frame = self.start_frame + idx
+        timestamp_ns = self.timestamps[global_frame] if global_frame < len(self.timestamps) else "0"
 
-        # Lazy load images
-        front_img = cv2.imread(str(self.front_dir / frame_name))
-        eye_img = cv2.imread(str(self.eye_dir / frame_name))
+        imgs = {cam: None for cam in ["left-front", "right-front"]}
 
-        # Safely extract keypoints (fallback to empty arrays if tracking dropped)
-        l_front = self.data_dict.get("left_hands_21kp_front", [])
-        r_front = self.data_dict.get("right_hands_21kp_front", [])
-        l_eye = self.data_dict.get("left_hands_21kp_eye", [])
-        r_eye = self.data_dict.get("right_hands_21kp_eye", [])
+        for cam in self.active_cameras:
+            cap = self._get_cap(cam)
+            if self._last_read_idx[cam] != global_frame - 1:
+                cap.set(cv2.CAP_PROP_POS_FRAMES, global_frame)
 
-        # Helper to get kps safely
-        def get_kps(arr):
-            return arr[idx] if len(arr) > idx else np.zeros((21, 3))
+            ret, frame = cap.read()
+            if ret:
+                imgs[cam] = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            self._last_read_idx[cam] = global_frame
+
+        l_front, r_front = self._load_and_merge_hand_streams(global_frame)
+
+        # Match c2w pose
+        frame_ts_ns = int(timestamp_ns)
+        closest_idx = np.abs(self.c2w_timestamps - frame_ts_ns).argmin()
+        c2w_pose = self.c2w_poses[closest_idx]
 
         return FrameData(
-            timestamp=self.timestamps[idx] if idx < len(self.timestamps) else 0.0,
-            front_img=front_img,
-            eye_img=eye_img,
-            left_kps_front=get_kps(l_front),
-            right_kps_front=get_kps(r_front),
-            left_kps_eye=get_kps(l_eye),
-            right_kps_eye=get_kps(r_eye),
+            timestamp_ns=timestamp_ns,
+            left_front_img=imgs["left-front"],
+            right_front_img=imgs["right-front"],
             stereo_params=self.stereo_params,
+            left_hand_3d=l_front,
+            right_hand_3d=r_front,
+            c2w_pose=c2w_pose,
+            caption=None,  # TODO: add patch for this
         )
+
+    def __del__(self):
+        for cap in getattr(self, "_caps", {}).values():
+            cap.release()
 
 
 class EgoDataset:
-    def __init__(self, index_path: str, aws_profile: str = None, target_dir: str = GROUNDED_DIR_DEFAULT):
+    def __init__(
+        self,
+        index_path: str,
+        active_cameras: list[str] = None,
+        aws_profile: str = None,
+        target_dir: str = GROUNDED_DIR_DEFAULT,
+    ):
         self.index_path = Path(index_path).expanduser()
         self.aws_profile = aws_profile
         self.target_dir = Path(target_dir).expanduser()
+        self.active_cameras = active_cameras or ["left-front", "right-front"]
 
         if not self.index_path.exists():
             raise FileNotFoundError(f"Index file not found: {self.index_path}")
@@ -114,17 +177,16 @@ class EgoDataset:
             data = json.load(f)
 
         self.metadata = data.get("metadata", {})
-        self.index = data.get("index", [])
+        self.index = list(data.get("index", {}).values())
+        print(f"Loaded dataset index with {len(self.index)} demonstrations.")
 
-        print(f"Loaded dataset index with {len(self.index)} demos.")
-
-    def _validate_demo_dir(self, demo_dir: Path) -> bool:
-        """Checks if a local directory has all necessary valid components."""
-        required = [demo_dir / "data.npz", demo_dir / "stereo_params.npz", demo_dir / "left-front", demo_dir / "left-eye"]
+    def _validate_demo_dir(self, rectified_data_dir: Path) -> bool:
+        required = [rectified_data_dir / "timestamp.txt", rectified_data_dir / "stereo_params.npz"]
+        for cam in self.active_cameras:
+            required.append(rectified_data_dir / f"{cam}.mp4")
         return all(p.exists() for p in required)
 
     def download_demo(self, demo_uri: str, s3_concurrency: int = 10) -> str:
-        """Ensures a specific demo is available locally and returns its path."""
         if not demo_uri.startswith("s3://"):
             local_path = Path(demo_uri).parent
             if not self._validate_demo_dir(local_path):
@@ -133,27 +195,22 @@ class EgoDataset:
 
         parsed = urlparse(demo_uri)
         bucket = parsed.netloc
-
-        s3_parent_key = str(Path(parsed.path.lstrip("/")).parent)
-        s3_target_dir = f"s3://{bucket}/{s3_parent_key}"
-
-        local_cache_dir = self.target_dir / bucket / s3_parent_key
+        s3_dir_key = str(Path(parsed.path.lstrip("/")).parent).replace("\\", "/")
+        s3_target_dir = f"s3://{bucket}/{s3_dir_key}"
+        local_cache_dir = self.target_dir / bucket / s3_dir_key
 
         if local_cache_dir.exists() and self._validate_demo_dir(local_cache_dir):
             return str(local_cache_dir)
 
         local_cache_dir.mkdir(parents=True, exist_ok=True)
-
         cmd = ["aws", "s3", "sync", s3_target_dir, str(local_cache_dir)]
         if self.aws_profile:
             cmd.extend(["--profile", self.aws_profile])
 
-        # Speed up the individual AWS S3 sync process by injecting environment variables
         env = os.environ.copy()
         env["AWS_MAX_CONCURRENT_REQUESTS"] = str(s3_concurrency)
 
         try:
-            # We capture output rather than sending to DEVNULL so we can print it if it fails
             subprocess.run(cmd, check=True, capture_output=True, text=True, env=env)
         except subprocess.CalledProcessError as e:
             raise RuntimeError(f"Failed to download {s3_target_dir}. Error: {e.stderr}") from e
@@ -164,19 +221,15 @@ class EgoDataset:
         return str(local_cache_dir)
 
     def download_dataset(self, max_workers: int = 4):
-        """Pre-fetches the entire dataset using multiple threads."""
         print(f"Starting parallel download with {max_workers} workers...")
-
-        # Use ThreadPoolExecutor for I/O bound tasks
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            # Submit all tasks to the executor
-            future_to_uri = {executor.submit(self.download_demo, uri): uri for uri in self.index}
+            unique_uris = {demo["perception_uri"] for demo in self.index}
+            future_to_uri = {executor.submit(self.download_demo, uri): uri for uri in unique_uris}
 
-            # Use tqdm to show a progress bar as tasks complete
-            for future in tqdm(as_completed(future_to_uri), total=len(self.index), desc="Downloading Demos"):
+            for future in tqdm(as_completed(future_to_uri), total=len(unique_uris), desc="Downloading Demo Segments"):
                 uri = future_to_uri[future]
                 try:
-                    future.result()  # This will raise any exceptions caught during download
+                    future.result()
                 except Exception as exc:
                     print(f"\nDemo {uri} generated an exception: {exc}")
 
@@ -184,6 +237,22 @@ class EgoDataset:
         return len(self.index)
 
     def __getitem__(self, idx) -> EgoEpisode:
-        demo_uri = self.index[idx]
-        local_dir = self.download_demo(demo_uri)
-        return EgoEpisode(local_dir)
+        demo_info = self.index[idx]
+        perception_uri = demo_info["perception_uri"]
+        trajectory_uri = demo_info.get("trajectory_uri")
+        local_dir = self.download_demo(perception_uri)
+
+        stereo_npz = np.load(
+            os.path.join(os.path.dirname(perception_uri), "stereo_params.npz"),
+            allow_pickle=True,
+        )
+        stereo_params = {key: stereo_npz[key] for key in stereo_npz.files}
+
+        return EgoEpisode(
+            rectified_data_dir=local_dir,
+            stereo_params=stereo_params,
+            start_frame=demo_info["frame_start"],
+            end_frame=demo_info["frame_end"],
+            active_cameras=self.active_cameras,
+            trajectory_uri=trajectory_uri,
+        )

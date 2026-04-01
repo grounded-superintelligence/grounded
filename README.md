@@ -51,7 +51,4 @@ episode: EgoEpisode = dataset[0]
 
 # visualize episode
 visualize_episode_to_mp4(episode, downsample=4, fps=30, overlay_text=False, output="test.mp4")
-
-# you can also download whole dataset, but this will be slow for now
-# dataset.download_dataset()
 ```
