@@ -193,6 +193,7 @@ def main():
         active_cameras=["left-front", "right-front"],
         aws_profile=args.profile,
         target_dir=args.dataset_dir,
+        min_duration_sec=2,
     )
 
     os.makedirs("outputs/", exist_ok=True)
@@ -201,7 +202,6 @@ def main():
             break
 
         episode = dataset[episode_idx]
-        print(f"Loaded Episode {episode_idx} with {len(episode)} frames.")
 
         visualize_episode_to_mp4(
             episode=episode,
