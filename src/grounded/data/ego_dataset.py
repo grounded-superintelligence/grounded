@@ -40,7 +40,7 @@ class PathManager:
 
 
 class EgoEpisode:
-    """A lazy-loaded, sliceable representation of a single demonstration interval."""
+    """A lazy-loaded, sliceable representation of a single episode interval."""
 
     def __init__(
         self,
@@ -178,28 +178,30 @@ class EgoDataset:
 
         self.metadata = data.get("metadata", {})
         self.index = list(data.get("index", {}).values())
-        print(f"Loaded dataset index with {len(self.index)} demonstrations.")
+        self.unique_uris = [episode["perception_uri"] for episode in self.index]
+        print(f"Loaded dataset index with {len(self.index)} episodes.")
 
-    def _validate_demo_dir(self, rectified_data_dir: Path) -> bool:
+    def _validate_episode_dir(self, rectified_data_dir: Path) -> bool:
         required = [rectified_data_dir / "timestamp.txt", rectified_data_dir / "stereo_params.npz"]
         for cam in self.active_cameras:
             required.append(rectified_data_dir / f"{cam}.mp4")
         return all(p.exists() for p in required)
 
-    def download_demo(self, demo_uri: str, s3_concurrency: int = 10) -> str:
-        if not demo_uri.startswith("s3://"):
-            local_path = Path(demo_uri).parent
-            if not self._validate_demo_dir(local_path):
-                raise ValueError(f"Local demo {local_path} is missing required files.")
+    def download_episode(self, episode_idx: int, s3_concurrency: int = 10) -> str:
+        episode_uri = self.unique_uris[episode_idx]
+        if not episode_uri.startswith("s3://"):
+            local_path = Path(episode_uri).parent
+            if not self._validate_episode_dir(local_path):
+                raise ValueError(f"Local episode {local_path} is missing required files.")
             return str(local_path)
 
-        parsed = urlparse(demo_uri)
+        parsed = urlparse(episode_uri)
         bucket = parsed.netloc
         s3_dir_key = str(Path(parsed.path.lstrip("/")).parent).replace("\\", "/")
         s3_target_dir = f"s3://{bucket}/{s3_dir_key}"
         local_cache_dir = self.target_dir / bucket / s3_dir_key
 
-        if local_cache_dir.exists() and self._validate_demo_dir(local_cache_dir):
+        if local_cache_dir.exists() and self._validate_episode_dir(local_cache_dir):
             return str(local_cache_dir)
 
         local_cache_dir.mkdir(parents=True, exist_ok=True)
@@ -215,32 +217,31 @@ class EgoDataset:
         except subprocess.CalledProcessError as e:
             raise RuntimeError(f"Failed to download {s3_target_dir}. Error: {e.stderr}") from e
 
-        if not self._validate_demo_dir(local_cache_dir):
-            raise ValueError(f"Downloaded demo {local_cache_dir} is missing required files.")
+        if not self._validate_episode_dir(local_cache_dir):
+            raise ValueError(f"Downloaded episode {local_cache_dir} is missing required files.")
 
         return str(local_cache_dir)
 
     def download_dataset(self, max_workers: int = 4):
         print(f"Starting parallel download with {max_workers} workers...")
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            unique_uris = {demo["perception_uri"] for demo in self.index}
-            future_to_uri = {executor.submit(self.download_demo, uri): uri for uri in unique_uris}
+            future_to_uri = {executor.submit(self.download_episode, idx): idx for idx in range(len(self.unique_uris))}
 
-            for future in tqdm(as_completed(future_to_uri), total=len(unique_uris), desc="Downloading Demo Segments"):
+            for future in tqdm(as_completed(future_to_uri), total=len(self.unique_uris), desc="Downloading episode Segments"):
                 uri = future_to_uri[future]
                 try:
                     future.result()
                 except Exception as exc:
-                    print(f"\nDemo {uri} generated an exception: {exc}")
+                    print(f"\nepisode {uri} generated an exception: {exc}")
 
     def __len__(self):
         return len(self.index)
 
     def __getitem__(self, idx) -> EgoEpisode:
-        demo_info = self.index[idx]
-        perception_uri = demo_info["perception_uri"]
-        trajectory_uri = demo_info.get("trajectory_uri")
-        local_dir = self.download_demo(perception_uri)
+        episode_info = self.index[idx]
+        perception_uri = episode_info["perception_uri"]
+        trajectory_uri = episode_info.get("trajectory_uri")
+        local_dir = self.download_episode(idx)
 
         stereo_npz = np.load(
             os.path.join(os.path.dirname(perception_uri), "stereo_params.npz"),
@@ -251,8 +252,8 @@ class EgoDataset:
         return EgoEpisode(
             rectified_data_dir=local_dir,
             stereo_params=stereo_params,
-            start_frame=demo_info["frame_start"],
-            end_frame=demo_info["frame_end"],
+            start_frame=episode_info["frame_start"],
+            end_frame=episode_info["frame_end"],
             active_cameras=self.active_cameras,
             trajectory_uri=trajectory_uri,
         )

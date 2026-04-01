@@ -42,7 +42,12 @@ from grounded.data.visualize import visualize_episode_to_mp4
 
 # initialize dataset
 # you target_dir defaults to your cache, so make sure to change this for each dataset
-dataset = EgoDataset("index.json", aws_profile="grounded", target_dir="~/.cache/grounded/data")
+dataset = EgoDataset(
+    "index.json",
+    aws_profile="grounded",
+    target_dir="~/.cache/grounded/data",
+    active_cameras=["left-front", "right-front"],
+)
 print(f"Found {len(dataset)} episodes")
 
 # initialize episode
@@ -50,5 +55,5 @@ dataset.download_episode(0)
 episode: EgoEpisode = dataset[0]
 
 # visualize episode
-visualize_episode_to_mp4(episode, downsample=4, fps=30, overlay_text=False, output="test.mp4")
+visualize_episode_to_mp4(episode, downsample=4, fps=30, output_path="test.mp4")
 ```

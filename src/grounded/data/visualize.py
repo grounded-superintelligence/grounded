@@ -70,7 +70,7 @@ def draw_uv_skeleton(image: np.ndarray, uvs: np.ndarray, is_right: bool):
             continue
         p1, p2 = (int(round(u1)), int(round(v1))), (int(round(u2)), int(round(v2)))
         if 0 <= p1[0] < w and 0 <= p1[1] < h and 0 <= p2[0] < w and 0 <= p2[1] < h:
-            cv2.line(img, p1, p2, JOINTS_COLOR, 2, cv2.LINE_AA)
+            cv2.line(img, p1, p2, JOINTS_COLOR, 3, cv2.LINE_AA)
     return img
 
 
@@ -85,7 +85,7 @@ def draw_uv_points(image: np.ndarray, uvs: np.ndarray, is_right: bool):
             continue
         x, y = int(round(u)), int(round(v))
         if 0 <= x < w and 0 <= y < h:
-            cv2.circle(img, (x, y), 4, color, -1, cv2.LINE_AA)
+            cv2.circle(img, (x, y), 7, color, -1, cv2.LINE_AA)
     return img
 
 
