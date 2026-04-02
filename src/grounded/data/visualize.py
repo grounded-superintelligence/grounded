@@ -89,10 +89,10 @@ def draw_uv_points(image: np.ndarray, uvs: np.ndarray, is_right: bool):
 # --- Depth Processing Helpers ---
 
 
-def get_global_depth_bounds(episode: EgoEpisode):
-    """Scans the episode to find the absolute min and max valid depth values."""
+def get_global_depth_bounds(episode: EgoEpisode, max_percentile: float = 90.0):
+    """Scans the episode to find the absolute min and percentile max valid depth values."""
     global_min = float("inf")
-    global_max = float("-inf")
+    samples = []
 
     for i in tqdm(range(len(episode)), desc="Finding depth bounds", leave=False):
         d = episode[i].left_depth
@@ -100,11 +100,20 @@ def get_global_depth_bounds(episode: EgoEpisode):
             valid = d[d > 0]
             if len(valid) > 0:
                 global_min = min(global_min, valid.min())
-                global_max = max(global_max, valid.max())
+                # Subsample (1 out of every 20 pixels) to keep memory usage safe across long episodes
+                samples.append(valid[::20])
 
-    if global_min == float("inf"):
+    if global_min == float("inf") or not samples:
         print("Warning: No valid depth data found in the episode. Using dummy bounds.")
         return 0.0, 1.0
+
+    # Cast to float32 to prevent numpy float16 overflow bugs during percentile calculation
+    all_samples = np.concatenate(samples).astype(np.float32)
+    global_max = float(np.percentile(all_samples, max_percentile))
+
+    # Safety catch: if max somehow equals min (e.g., flat depth map), pad it to avoid div by zero
+    if not np.isfinite(global_max) or global_max <= global_min:
+        global_max = global_min + 1.0
 
     return global_min, global_max
 
@@ -141,23 +150,35 @@ def warp_left_depth_to_right(left_depth: np.ndarray, P1: np.ndarray, P2: np.ndar
     right_depth[y_right, x_right] = z_val
     right_depth[right_depth == np.inf] = 0
 
-    # Morphological close to fill rounding cracks
-    kernel = np.ones((3, 3), np.uint8)
-    right_depth = cv2.morphologyEx(right_depth, cv2.MORPH_CLOSE, kernel)
-
+    # Note: Removed the cv2.morphologyEx morphological close step.
+    # Missing projections will stay exactly 0 (which colorizes to black).
     return right_depth
 
 
 def colorize_normalized_depth(depth: np.ndarray, vmin: float, vmax: float) -> np.ndarray:
     """Normalizes a depth map against global bounds and applies a colormap."""
-    depth = np.clip(depth, a_min=vmin, a_max=vmax)
-    norm = (depth - vmin) / (vmax - vmin)
+    # Prevent division by zero if vmin == vmax
+    if vmax <= vmin:
+        vmax = vmin + 1e-5
+
+    # 1. Identify missing pixels BEFORE clipping alters their values
+    missing_mask = depth == 0
+
+    # 2. Clip and normalize
+    depth_clipped = np.clip(depth, a_min=vmin, a_max=vmax)
+    norm = (depth_clipped - vmin) / (vmax - vmin)
     norm = np.clip(norm, 0, 1)
     norm = 1.0 - norm  # Invert so closer is hotter
 
+    # Ensure there are no NaNs bleeding through before casting to uint8
+    norm = np.nan_to_num(norm, nan=0.0)
+
+    # 3. Apply colormap
     norm_8u = (norm * 255).astype(np.uint8)
     colorized = cv2.applyColorMap(norm_8u, cv2.COLORMAP_INFERNO)
-    colorized[depth == 0] = 0
+
+    # 4. Force missing pixels to pure black using the saved mask
+    colorized[missing_mask] = 0
 
     return colorized
 
@@ -177,8 +198,7 @@ def visualize_episode_to_mp4(episode: EgoEpisode, output_path: str, downsample: 
     writer = None
 
     # Pass 1: Global Bounds for consistent depth coloring across the video
-    vmin, vmax = get_global_depth_bounds(episode)
-    vmax = min(vmax, 20)
+    vmin, vmax = get_global_depth_bounds(episode, max_percentile=90.0)
 
     # Pass 2: Render Video
     for i in tqdm(range(len(episode)), desc="Rendering Video", leave=False):

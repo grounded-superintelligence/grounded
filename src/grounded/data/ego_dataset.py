@@ -252,6 +252,7 @@ class EgoDataset:
 
         def _sync_s3_file(s3_src: str, local_dst: str):
             if not os.path.exists(local_dst):
+                print(f"\rpulling {s3_src} ...", end="", flush=True)
                 cmd = ["aws", "s3", "cp", s3_src, local_dst]
                 if self.aws_profile:
                     cmd.extend(["--profile", self.aws_profile])
@@ -286,7 +287,6 @@ class EgoDataset:
                 files_to_download.append((s3_paths.right_front_mp4, local_paths.right_front_mp4))
 
             for s3_src, local_dst in files_to_download:
-                print(f"\rpulling {s3_src} ...", end="", flush=True)
                 _sync_s3_file(s3_src, local_dst)
 
             # Download ONLY the Hand Pose and Depth frames needed concurrently
