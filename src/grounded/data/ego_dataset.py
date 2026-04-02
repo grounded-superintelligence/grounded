@@ -5,7 +5,7 @@ import subprocess
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
+from typing import Dict, Optional
 from urllib.parse import urlparse
 
 import cv2
@@ -19,14 +19,14 @@ GROUNDED_DIR_DEFAULT = os.path.expanduser("~/.cache/grounded/data/")
 class FrameData:
     """Dataclass holding all synchronized data for a single frame."""
 
-    timestamp_ns: str
-    left_front_img: np.ndarray | None
-    right_front_img: np.ndarray | None
-    stereo_params: dict
-    left_hand_3d: np.ndarray
-    right_hand_3d: np.ndarray
-    c2w_pose: Optional[np.ndarray]  # [tx, ty, tz, qx, qy, qz, qw]
-    caption: str = None  # TODO: add patch for this
+    timestamp_ns: int
+    left_rgb: np.ndarray
+    right_rgb: np.ndarray
+    stereo_params: Dict[str, np.ndarray]
+    left_hand_kp: np.ndarray
+    right_hand_kp: np.ndarray
+    left_depth: np.ndarray
+    c2w: Optional[np.ndarray]  # [tx, ty, tz, qx, qy, qz, qw]
 
 
 class PathManager:
@@ -38,6 +38,7 @@ class PathManager:
 
         # Define synchronized sub-paths
         self.hand_pose_dir = posixpath.join(hand_dir, "hand_tracking", "poses", "refined", "params")
+        self.pcd_dir = posixpath.join(hand_dir, "compressed_pcds", "left-front")
         self.slam_trajectory_txt = posixpath.join(processed_dir, "slam", "mav0", "pycuvslam_trajectory.txt")
         self.left_front_mp4 = posixpath.join(rectified_dir, "left-front.mp4")
         self.right_front_mp4 = posixpath.join(rectified_dir, "right-front.mp4")
@@ -61,6 +62,9 @@ class EgoEpisode:
         self.end_frame = end_frame
         self.active_cameras = active_cameras
 
+        # TODO: add support for caption loading in next version
+        self.caption = None
+
         stereo_npz = np.load(self.path_manager.stereo_params_npz, allow_pickle=True)
         self.stereo_params = {key: stereo_npz[key] for key in stereo_npz.files}
 
@@ -77,7 +81,7 @@ class EgoEpisode:
 
         traj_data = np.loadtxt(self.path_manager.slam_trajectory_txt, comments="#")
         if traj_data.ndim == 1:
-            traj_data = traj_data[np.newaxis, :]
+            traj_data = traj_data[None, :]
 
         # Note: based on your data, trajectory is in seconds.
         # Convert trajectory timestamps to nanoseconds.
@@ -116,6 +120,11 @@ class EgoEpisode:
 
         return l_front, r_front
 
+    def _load_depth_stream(self, global_frame: int) -> np.ndarray | None:
+        pcd_path = os.path.join(self.path_manager.pcd_dir, f"frame_{global_frame:06d}.npz")
+        with np.load(pcd_path) as pcd_data:
+            return pcd_data["z"]
+
     def __len__(self):
         return self.end_frame - self.start_frame
 
@@ -124,7 +133,7 @@ class EgoEpisode:
             return [self.__getitem__(i) for i in range(*idx.indices(len(self)))]
 
         global_frame = self.start_frame + idx
-        timestamp_ns = self.timestamps[global_frame] if global_frame < len(self.timestamps) else "0"
+        timestamp_ns = int(self.timestamps[global_frame])
 
         imgs = {cam: None for cam in ["left-front", "right-front"]}
 
@@ -139,21 +148,22 @@ class EgoEpisode:
             self._last_read_idx[cam] = global_frame
 
         l_front, r_front = self._load_and_merge_hand_streams(global_frame)
+        left_depth = self._load_depth_stream(global_frame)
 
         # Match c2w pose
         frame_ts_ns = int(timestamp_ns)
         closest_idx = np.abs(self.c2w_timestamps - frame_ts_ns).argmin()
-        c2w_pose = self.c2w_poses[closest_idx]
+        c2w = self.c2w_poses[closest_idx]
 
         return FrameData(
             timestamp_ns=timestamp_ns,
-            left_front_img=imgs["left-front"],
-            right_front_img=imgs["right-front"],
+            left_rgb=imgs["left-front"],
+            right_rgb=imgs["right-front"],
             stereo_params=self.stereo_params,
-            left_hand_3d=l_front,
-            right_hand_3d=r_front,
-            c2w_pose=c2w_pose,
-            caption=None,  # TODO: add patch for this
+            left_hand_kp=l_front,
+            right_hand_kp=r_front,
+            left_depth=left_depth,
+            c2w=c2w,
         )
 
     def __del__(self):
@@ -206,45 +216,65 @@ class EgoDataset:
         print(f"Loaded dataset index with {len(self.index)} episodes (min duration threshold: {min_duration_sec}s).")
         print(f"Total dataset duration: {total_duration_sec:.2f} seconds ({total_frames} frames at {dataset_fps} FPS).")
 
-    def _validate_episode_dir(self, path_manager: PathManager) -> bool:
+    def _validate_episode_dir(self, path_manager: PathManager, frame_start: int, frame_end: int) -> bool:
         required = [
             path_manager.timestamp_txt,
             path_manager.stereo_params_npz,
             path_manager.slam_trajectory_txt,
             path_manager.hand_pose_dir,
+            path_manager.pcd_dir,
         ]
         if "left-front" in self.active_cameras:
             required.append(path_manager.left_front_mp4)
         if "right-front" in self.active_cameras:
             required.append(path_manager.right_front_mp4)
-        return all(os.path.exists(p) for p in required)
+
+        # 1. Check if base required files and directories exist
+        if not all(os.path.exists(p) for p in required):
+            return False
+
+        # 2. Validate that the specific requested frames actually downloaded
+        if frame_end > frame_start:
+            for i in (frame_start, frame_end - 1):
+                hand_file = os.path.join(path_manager.hand_pose_dir, f"frame_{i:06d}.npz")
+                pcd_file = os.path.join(path_manager.pcd_dir, f"frame_{i:06d}.npz")
+                if not os.path.exists(hand_file) or not os.path.exists(pcd_file):
+                    return False
+
+        return True
 
     def download_episode(self, episode_idx: int, s3_concurrency: int = 10) -> str:
-        episode_uri = self.unique_uris[episode_idx]  # s3://.../hand/rectified_dataset/timestamp.txt
+        episode_info = self.index[episode_idx]
+        frame_start = episode_info["frame_start"]
+        frame_end = episode_info["frame_end"]
+
+        episode_uri = self.unique_uris[episode_idx]
+
+        def _sync_s3_file(s3_src: str, local_dst: str):
+            if not os.path.exists(local_dst):
+                cmd = ["aws", "s3", "cp", s3_src, local_dst]
+                if self.aws_profile:
+                    cmd.extend(["--profile", self.aws_profile])
+                subprocess.run(cmd, check=True, capture_output=True, text=True, env=env)
 
         if episode_uri.startswith("s3://"):
             parsed = urlparse(episode_uri)
             bucket = parsed.netloc
 
-            # 1. Identify the 'rectified_dataset' directory as the root for PathManager
             s3_rectified_key = posixpath.dirname(parsed.path.lstrip("/"))
             s3_rectified_data_dir = f"s3://{bucket}/{s3_rectified_key}"
-
-            # 2. Local root mirror
             local_rectified_data_dir = str(self.target_dir / bucket / s3_rectified_key)
 
-            # 3. Apply PathManager to both (Recycling logic)
             s3_paths = PathManager(s3_rectified_data_dir)
             local_paths = PathManager(local_rectified_data_dir)
 
-            # Ensure local directories exist
             os.makedirs(local_rectified_data_dir, exist_ok=True)
             os.makedirs(local_paths.hand_pose_dir, exist_ok=True)
+            os.makedirs(local_paths.pcd_dir, exist_ok=True)
 
             env = os.environ.copy()
             env["AWS_MAX_CONCURRENT_REQUESTS"] = str(s3_concurrency)
 
-            # 1. Download specific files inside rectified_data_dir (cp)
             files_to_download = [
                 (s3_paths.timestamp_txt, local_paths.timestamp_txt),
                 (s3_paths.stereo_params_npz, local_paths.stereo_params_npz),
@@ -256,25 +286,35 @@ class EgoDataset:
                 files_to_download.append((s3_paths.right_front_mp4, local_paths.right_front_mp4))
 
             for s3_src, local_dst in files_to_download:
-                if not os.path.exists(local_dst):
-                    cmd = ["aws", "s3", "cp", s3_src, local_dst]
-                    if self.aws_profile:
-                        cmd.extend(["--profile", self.aws_profile])
-                    subprocess.run(cmd, check=True, capture_output=True, text=True, env=env)
+                print(f"\rpulling {s3_src} ...", end="", flush=True)
+                _sync_s3_file(s3_src, local_dst)
 
-            # 2. Download the hand pose directory (sync)
-            # Using sync because this directory contains multiple frame_XXXXXX.npz files
-            if not os.listdir(local_paths.hand_pose_dir):
-                cmd = ["aws", "s3", "sync", s3_paths.hand_pose_dir, local_paths.hand_pose_dir]
-                if self.aws_profile:
-                    cmd.extend(["--profile", self.aws_profile])
-                subprocess.run(cmd, check=True, capture_output=True, text=True, env=env)
+            # Download ONLY the Hand Pose and Depth frames needed concurrently
+            def download_single_frame(frame_idx: int):
+                filename = f"frame_{frame_idx:06d}.npz"
+
+                # Pairings of (s3_source, local_dest)
+                frame_targets = [
+                    (posixpath.join(s3_paths.hand_pose_dir, filename), os.path.join(local_paths.hand_pose_dir, filename)),
+                    (posixpath.join(s3_paths.pcd_dir, filename), os.path.join(local_paths.pcd_dir, filename)),
+                ]
+                for s3_src, local_dst in frame_targets:
+                    _sync_s3_file(s3_src, local_dst)
+
+            # Execute the frame downloads concurrently
+            with ThreadPoolExecutor(max_workers=s3_concurrency) as executor:
+                futures = [executor.submit(download_single_frame, i) for i in range(frame_start, frame_end)]
+                for future in as_completed(futures):
+                    try:
+                        future.result()
+                    except Exception as exc:
+                        print(f"\nFrame download generated an exception: {exc}")
 
         else:
             local_rectified_data_dir = os.path.abspath(os.path.dirname(episode_uri))
             local_paths = PathManager(local_rectified_data_dir)
 
-        if not self._validate_episode_dir(local_paths):
+        if not self._validate_episode_dir(local_paths, frame_start, frame_end):
             raise ValueError(f"Downloaded episode {local_rectified_data_dir} is missing required files.")
 
         return local_rectified_data_dir
