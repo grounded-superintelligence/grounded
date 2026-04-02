@@ -40,13 +40,16 @@ You should be given an `index.json` and `credentials` that corresponds your prop
 from grounded.data.ego_dataset import EgoDataset, EgoEpisode
 from grounded.data.visualize import visualize_episode_to_mp4
 
+INDEX_JSON = "index.json"  # change this to your path
+EPISODE_IDX = 0
+
 # initialize dataset
 # you target_dir defaults to your cache, so make sure to change this for each dataset
 dataset = EgoDataset("index.json", aws_profile="grounded", active_cameras=["left-front", "right-front"], min_duration_sec=2)
 print(f"Found {len(dataset)} episodes")
 
 # initialize episode
-episode: EgoEpisode = dataset[0]  # this will download it internally if it's missing
+episode: EgoEpisode = dataset[EPISODE_IDX]  # this will download it internally if it's missing
 
 # visualize episode
 visualize_episode_to_mp4(episode, downsample=4, fps=30, output_path="test.mp4")
