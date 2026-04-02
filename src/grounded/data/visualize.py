@@ -1,22 +1,27 @@
 #!/usr/bin/env python3
 import argparse
+import os
 
 import cv2
 import numpy as np
 from tqdm import tqdm
 
-from grounded.data.ego_dataset import GROUNDED_DIR_DEFAULT, EgoDataset
+from grounded.data.ego_dataset import GROUNDED_DIR_DEFAULT, EgoDataset, EgoEpisode
 
 # --- Drawing Constants & Helpers ---
-LEFT_HAND_COLOR = (25, 50, 255)
-RIGHT_HAND_COLOR = (25, 50, 255)
+LEFT_HAND_COLOR = (165, 255, 100)
+RIGHT_HAND_COLOR = (255, 100, 200)
+JOINTS_COLOR = (255, 255, 255)
 
 
 def project_points(points_3d: np.ndarray, P: np.ndarray):
+    """Projects 3D points into 2D."""
     if points_3d is None or len(points_3d) == 0 or np.linalg.norm(points_3d) < 1e-2:
         return np.zeros((0, 2), dtype=int)
+
     ones = np.ones((points_3d.shape[0], 1), dtype=points_3d.dtype)
     points_3d_h = np.concatenate([points_3d, ones], axis=-1)
+
     points_2d_h = (P @ points_3d_h.T).T
     z = points_2d_h[:, 2]
     z[np.abs(z) < 1e-5] = 1e-5
@@ -29,37 +34,40 @@ def draw_uv_skeleton(image: np.ndarray, uvs: np.ndarray, is_right: bool):
         return image
     img = image.copy()
     h, w = img.shape[:2]
-    color = RIGHT_HAND_COLOR if is_right else LEFT_HAND_COLOR
+
     edges = [
         (0, 1),
+        (1, 5),
+        (5, 9),
+        (9, 13),
+        (13, 17),
+        (17, 0),  # Palm
         (1, 2),
         (2, 3),
-        (3, 4),
-        (0, 5),
+        (3, 4),  # Thumb
         (5, 6),
         (6, 7),
-        (7, 8),
-        (0, 9),
+        (7, 8),  # Index
         (9, 10),
         (10, 11),
-        (11, 12),
-        (0, 13),
+        (11, 12),  # Middle
         (13, 14),
         (14, 15),
-        (15, 16),
-        (0, 17),
+        (15, 16),  # Ring
         (17, 18),
         (18, 19),
-        (19, 20),
+        (19, 20),  # Pinky
     ]
     for i, j in edges:
+        if i >= len(uvs) or j >= len(uvs):
+            continue
         u1, v1 = uvs[i]
         u2, v2 = uvs[j]
         if not np.all(np.isfinite([u1, v1, u2, v2])):
             continue
         p1, p2 = (int(round(u1)), int(round(v1))), (int(round(u2)), int(round(v2)))
         if 0 <= p1[0] < w and 0 <= p1[1] < h and 0 <= p2[0] < w and 0 <= p2[1] < h:
-            cv2.line(img, p1, p2, color, 2, cv2.LINE_AA)
+            cv2.line(img, p1, p2, JOINTS_COLOR, 3, cv2.LINE_AA)
     return img
 
 
@@ -74,105 +82,257 @@ def draw_uv_points(image: np.ndarray, uvs: np.ndarray, is_right: bool):
             continue
         x, y = int(round(u)), int(round(v))
         if 0 <= x < w and 0 <= y < h:
-            cv2.circle(img, (x, y), 4, color, -1, cv2.LINE_AA)
+            cv2.circle(img, (x, y), 7, color, -1, cv2.LINE_AA)
     return img
 
 
-def visualize_episode_to_mp4(episode, output_path: str, downsample: int = 2, fps: float = 30.0, overlay_text: bool = False):
+# --- Depth Processing Helpers ---
+
+
+def get_global_depth_bounds(episode: EgoEpisode, max_percentile: float = 90.0):
+    """Scans the episode to find the absolute min and percentile max valid depth values."""
+    global_min = float("inf")
+    samples = []
+
+    for i in tqdm(range(len(episode)), desc="Finding depth bounds", leave=False):
+        d = episode[i].left_depth
+        if d is not None:
+            valid = d[d > 0]
+            if len(valid) > 0:
+                global_min = min(global_min, valid.min())
+                # Subsample (1 out of every 20 pixels) to keep memory usage safe across long episodes
+                samples.append(valid[::20])
+
+    if global_min == float("inf") or not samples:
+        print("Warning: No valid depth data found in the episode. Using dummy bounds.")
+        return 0.0, 1.0
+
+    # Cast to float32 to prevent numpy float16 overflow bugs during percentile calculation
+    all_samples = np.concatenate(samples).astype(np.float32)
+    global_max = float(np.percentile(all_samples, max_percentile))
+
+    # Safety catch: if max somehow equals min (e.g., flat depth map), pad it to avoid div by zero
+    if not np.isfinite(global_max) or global_max <= global_min:
+        global_max = global_min + 1.0
+
+    return global_min, global_max
+
+
+def warp_left_depth_to_right(left_depth: np.ndarray, P1: np.ndarray, P2: np.ndarray) -> np.ndarray:
+    """Forward-warps a rectified left depth map to the right camera view."""
+    H, W = left_depth.shape
+    right_depth = np.full((H, W), np.inf)
+
+    y, x = np.indices((H, W))
+
+    valid_mask = left_depth > 0
+    z_valid = left_depth[valid_mask]
+    x_valid = x[valid_mask]
+    y_valid = y[valid_mask]
+
+    # Calculate disparity
+    Tx_fx = P2[0, 3]
+    disparity = -Tx_fx / z_valid
+
+    x_right = np.round(x_valid - disparity).astype(int)
+
+    in_bounds = (x_right >= 0) & (x_right < W)
+    x_right = x_right[in_bounds]
+    y_right = y_valid[in_bounds]
+    z_val = z_valid[in_bounds]
+
+    # Z-buffer sort (render far to near so near overwrites)
+    sort_idx = np.argsort(z_val)[::-1]
+    x_right = x_right[sort_idx]
+    y_right = y_right[sort_idx]
+    z_val = z_val[sort_idx]
+
+    right_depth[y_right, x_right] = z_val
+    right_depth[right_depth == np.inf] = 0
+
+    # Note: Removed the cv2.morphologyEx morphological close step.
+    # Missing projections will stay exactly 0 (which colorizes to black).
+    return right_depth
+
+
+def colorize_normalized_depth(depth: np.ndarray, vmin: float, vmax: float) -> np.ndarray:
+    """Normalizes a depth map against global bounds and applies a colormap."""
+    # Prevent division by zero if vmin == vmax
+    if vmax <= vmin:
+        vmax = vmin + 1e-5
+
+    # 1. Identify missing pixels BEFORE clipping alters their values
+    missing_mask = depth == 0
+
+    # 2. Clip and normalize
+    depth_clipped = np.clip(depth, a_min=vmin, a_max=vmax)
+    norm = (depth_clipped - vmin) / (vmax - vmin)
+    norm = np.clip(norm, 0, 1)
+    norm = 1.0 - norm  # Invert so closer is hotter
+
+    # Ensure there are no NaNs bleeding through before casting to uint8
+    norm = np.nan_to_num(norm, nan=0.0)
+
+    # 3. Apply colormap
+    norm_8u = (norm * 255).astype(np.uint8)
+    colorized = cv2.applyColorMap(norm_8u, cv2.COLORMAP_INFERNO)
+
+    # 4. Force missing pixels to pure black using the saved mask
+    colorized[missing_mask] = 0
+
+    return colorized
+
+
+# --- Visualization Routines ---
+
+
+def visualize_episode_to_mp4(episode: EgoEpisode, output_path: str, downsample: int = 2, fps: float = 30.0):
     """
-    Renders an EgoEpisode object with 2D keypoint projections and saves it as an MP4 video.
+    Renders an EgoEpisode object with canonical 2D keypoint projections and tiled depth maps.
     """
     if len(episode) == 0:
         print("Error: The provided episode is empty.")
         return
 
-    # 1. Setup Dimensions
-    first_frame = episode[0]
-    h_f, w_f = first_frame.front_img.shape[:2]
-    h_e, w_e = first_frame.eye_img.shape[:2]
-
-    target_w = max(w_f // downsample, w_e // downsample)
-    new_h_front = int((target_w / (w_f // downsample)) * (h_f // downsample))
-    new_h_eye = int((target_w / (w_e // downsample)) * (h_e // downsample))
-    target_h = new_h_front + new_h_eye
-
-    # 2. Setup VideoWriter
     out_path = output_path if output_path.endswith(".mp4") else f"{output_path}.mp4"
-    writer = cv2.VideoWriter(out_path, cv2.VideoWriter_fourcc(*"mp4v"), fps, (target_w, target_h))
+    writer = None
 
-    # 3. Render Loop
-    for i in tqdm(range(len(episode)), desc="Rendering Video"):
-        # The SDK lazy-loads the images and keypoints here
+    # Pass 1: Global Bounds for consistent depth coloring across the video
+    vmin, vmax = get_global_depth_bounds(episode, max_percentile=90.0)
+
+    # Pass 2: Render Video
+    for i in tqdm(range(len(episode)), desc="Rendering Video", leave=False):
         frame = episode[i]
+        params = frame.stereo_params
 
-        img_front = frame.front_img
-        img_eye = frame.eye_img
+        # Prepare depths for active cameras
+        left_depth = frame.left_depth
+        rgb_h, rgb_w = frame.left_rgb.shape[:2]
+        if left_depth.shape[:2] != (rgb_h, rgb_w):
+            left_depth = cv2.resize(left_depth, (rgb_w, rgb_h), interpolation=cv2.INTER_NEAREST)
 
-        # Extract projection matrices from the stereo dict
-        front_P1 = frame.stereo_params.get("front_P1", None)
-        eye_P1 = frame.stereo_params.get("eye_P1", None)
-        baseline = frame.stereo_params.get("front_baseline", None)
+        right_depth = None
+        if "right-front" in episode.active_cameras:
+            right_depth = warp_left_depth_to_right(
+                left_depth,
+                params["front_P1"],
+                params["front_P2"],
+            )
 
-        # Draw Front
-        if front_P1 is not None:
-            l_kps2d = project_points(frame.left_kps_front, front_P1)
-            img_front = draw_uv_skeleton(draw_uv_points(img_front, l_kps2d, False), l_kps2d, False)
+        cam_configs = []
+        if "left-front" in episode.active_cameras:
+            cam_configs.append(
+                {
+                    "img": frame.left_rgb,
+                    "P": params["front_P1"],
+                    "depth": left_depth,
+                    "transform": lambda pts: pts,
+                }
+            )
+        if "right-front" in episode.active_cameras:
+            cam_configs.append(
+                {
+                    "img": frame.right_rgb,
+                    "P": params["front_P2"],
+                    "depth": right_depth,
+                    "transform": lambda pts: pts,
+                }
+            )
 
-            r_kps2d = project_points(frame.right_kps_front, front_P1)
-            img_front = draw_uv_skeleton(draw_uv_points(img_front, r_kps2d, True), r_kps2d, True)
+        processed_rows = []
 
-        # Draw Eye
-        if eye_P1 is not None:
-            l_kps2d = project_points(frame.left_kps_eye, eye_P1)
-            img_eye = draw_uv_skeleton(draw_uv_points(img_eye, l_kps2d, False), l_kps2d, False)
+        for config in cam_configs:
+            img_rgb = config["img"]
+            P = config["P"]
+            depth_raw = config["depth"]
 
-            r_kps2d = project_points(frame.right_kps_eye, eye_P1)
-            img_eye = draw_uv_skeleton(draw_uv_points(img_eye, r_kps2d, True), r_kps2d, True)
+            if img_rgb is None:
+                continue
 
-        # Resize and Stack
-        img_front = cv2.resize(img_front, (target_w, new_h_front))
-        img_eye = cv2.resize(img_eye, (target_w, new_h_eye))
-        stacked = np.vstack((img_front, img_eye))
+            img_bgr = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2BGR)
 
-        # Text Overlay
-        if overlay_text:
-            text_y = 30
-            cv2.putText(stacked, f"Time: {frame.timestamp:.3f}s", (10, text_y), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-            if baseline is not None:
-                cv2.putText(
-                    stacked, f"Baseline: {baseline:.4f}", (10, text_y + 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2
-                )
+            # Project Left Hand
+            if frame.left_hand_kp is not None and len(frame.left_hand_kp) > 0:
+                l_pts = config["transform"](frame.left_hand_kp)
+                l_kps2d = project_points(l_pts, P)
+                img_bgr = draw_uv_skeleton(draw_uv_points(img_bgr, l_kps2d, False), l_kps2d, False)
+
+            # Project Right Hand
+            if frame.right_hand_kp is not None and len(frame.right_hand_kp) > 0:
+                r_pts = config["transform"](frame.right_hand_kp)
+                r_kps2d = project_points(r_pts, P)
+                img_bgr = draw_uv_skeleton(draw_uv_points(img_bgr, r_kps2d, True), r_kps2d, True)
+
+            # Colorize Depth
+            depth_color = colorize_normalized_depth(depth_raw, vmin, vmax)
+
+            # Ensure depth shape strictly matches image shape before hstack
+            if depth_color.shape[:2] != img_bgr.shape[:2]:
+                depth_color = cv2.resize(depth_color, (img_bgr.shape[1], img_bgr.shape[0]))
+
+            # Tile: [RGB with Overlays | Depth Map]
+            row = np.hstack([img_bgr, depth_color])
+            processed_rows.append(row)
+
+        if not processed_rows:
+            continue
+
+        # Vertically stack all active cameras
+        stacked = np.vstack(processed_rows)
+
+        # Downsample the entire combined image block
+        if downsample > 1:
+            h, w = stacked.shape[:2]
+            new_w = w // downsample
+            new_h = int(h * (new_w / w))
+            stacked = cv2.resize(stacked, (new_w, new_h))
+
+        # Initialize VideoWriter dynamically based on final stacked frame size
+        if writer is None:
+            target_h, target_w = stacked.shape[:2]
+            writer = cv2.VideoWriter(out_path, cv2.VideoWriter_fourcc(*"mp4v"), fps, (target_w, target_h))
 
         writer.write(stacked)
 
-    writer.release()
-    print(f"Saved to {out_path}")
+    if writer is not None:
+        writer.release()
+        print(f"Saved to {out_path}")
+    else:
+        print("Error: No frames were written to the video.")
 
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--index_json", type=str, required=True)
     parser.add_argument("--dataset_dir", type=str, default=GROUNDED_DIR_DEFAULT)
-    parser.add_argument("--episode_idx", type=int, default=0, help="Index of the demonstration to visualize")
-    parser.add_argument("--profile", type=str, default="grounded", help="AWS profile to use for downloading")
-    parser.add_argument("--output", type=str, default="sdk_visualization.mp4")
+    parser.add_argument("--profile", type=str, default=None, help="AWS profile to use for downloading")
     parser.add_argument("--downsample", type=int, default=2)
     parser.add_argument("--fps", type=float, default=30.0)
-    parser.add_argument("--overlay_text", action="store_true")
     args = parser.parse_args()
 
-    # Initialize SDK
     print(f"Loading dataset from {args.index_json}...")
-    dataset = EgoDataset(index_path=args.index_json, aws_profile=args.profile, target_dir=args.dataset_dir)
 
-    # Grab the specified episode
-    episode = dataset[args.episode_idx]
-    print(f"Loaded Episode {args.episode_idx} with {len(episode)} frames.")
-
-    # Call the new visualization function
-    visualize_episode_to_mp4(
-        episode=episode, output_path=args.output, downsample=args.downsample, fps=args.fps, overlay_text=args.overlay_text
+    dataset = EgoDataset(
+        index_path=args.index_json,
+        active_cameras=["left-front", "right-front"],
+        aws_profile=args.profile,
+        target_dir=args.dataset_dir,
+        min_duration_sec=2,
     )
+
+    os.makedirs("outputs/", exist_ok=True)
+    for episode_idx in range(10):
+        if episode_idx >= len(dataset):
+            break
+
+        episode = dataset[episode_idx]
+
+        visualize_episode_to_mp4(
+            episode=episode,
+            output_path=f"outputs/sdkvis{episode_idx}.mp4",
+            downsample=args.downsample,
+            fps=args.fps,
+        )
 
 
 if __name__ == "__main__":
