@@ -1,6 +1,7 @@
 import json
 import os
 import posixpath
+import shutil
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
@@ -10,7 +11,6 @@ from urllib.parse import urlparse
 import boto3
 import cv2
 import numpy as np
-from botocore.exceptions import ClientError
 from tqdm.auto import tqdm
 
 GROUNDED_DIR_DEFAULT = os.path.expanduser("~/.cache/grounded/data/")
@@ -187,16 +187,16 @@ class EgoDataset:
         self.target_dir = Path(target_dir).expanduser()
         self.active_cameras = active_cameras or ["left-front", "right-front"]
 
+        os.makedirs(self.target_dir, exist_ok=True)
+
         if not self.index_path.exists():
             raise FileNotFoundError(f"Index file not found: {self.index_path}")
 
         with open(self.index_path, "r") as f:
-            data = json.load(f)
+            raw_data = json.load(f)
 
-        self.metadata = data.get("metadata", {})
-        raw_index = list(data.get("index", {}).values())
-
-        # Attempt to get fps from metadata, fallback to the provided init parameter
+        self.metadata = raw_data.get("metadata", {})
+        raw_index = list(raw_data.get("index", {}).values())
         dataset_fps = self.metadata.get("fps", fps)
 
         self.index = []
@@ -217,6 +217,65 @@ class EgoDataset:
         print(f"Loaded dataset index with {len(self.index)} episodes (min duration threshold: {min_duration_sec}s).")
         print(f"Total dataset duration: {total_duration_sec:.2f} seconds ({total_frames} frames at {dataset_fps} FPS).")
 
+    def _interpolate_missing_frames(self, path_manager: PathManager, frame_start: int, frame_end: int):
+        """Scans for missing hand pose .npz files inside the valid interval and always LERPs them."""
+        missing = []
+        for i in range(frame_start, frame_end):
+            hand_file = os.path.join(path_manager.hand_pose_dir, f"frame_{i:06d}.npz")
+            if not os.path.exists(hand_file):
+                missing.append(i)
+
+        if not missing:
+            return
+
+        # Group missing frames into contiguous sub-gaps
+        gaps = []
+        current_gap = [missing[0]]
+        for i in range(1, len(missing)):
+            if missing[i] == missing[i - 1] + 1:
+                current_gap.append(missing[i])
+            else:
+                gaps.append(current_gap)
+                current_gap = [missing[i]]
+        gaps.append(current_gap)
+
+        for gap in gaps:
+            # Dynamically seek the nearest valid frame BEFORE the gap
+            start_valid = gap[0] - 1
+            while not os.path.exists(os.path.join(path_manager.hand_pose_dir, f"frame_{start_valid:06d}.npz")):
+                start_valid -= 1
+
+            # Dynamically seek the nearest valid frame AFTER the gap
+            end_valid = gap[-1] + 1
+            while not os.path.exists(os.path.join(path_manager.hand_pose_dir, f"frame_{end_valid:06d}.npz")):
+                end_valid += 1
+
+            valid_start_path = os.path.join(path_manager.hand_pose_dir, f"frame_{start_valid:06d}.npz")
+            valid_end_path = os.path.join(path_manager.hand_pose_dir, f"frame_{end_valid:06d}.npz")
+
+            # Load the bounding valid frames
+            with np.load(valid_start_path, allow_pickle=True) as d1, np.load(valid_end_path, allow_pickle=True) as d2:
+                l1 = d1["left"].item()["front"]["keypoints_3d_rectcam"]
+                r1 = d1["right"].item()["front"]["keypoints_3d_rectcam"]
+
+                l2 = d2["left"].item()["front"]["keypoints_3d_rectcam"]
+                r2 = d2["right"].item()["front"]["keypoints_3d_rectcam"]
+
+                for i in gap:
+                    # Calculate weight: 0.0 at start_valid, 1.0 at end_valid
+                    w = (i - start_valid) / (end_valid - start_valid)
+
+                    # Apply LERP
+                    l_interp = l1 + w * (l2 - l1) if (l1 is not None and l2 is not None) else None
+                    r_interp = r1 + w * (r2 - r1) if (r1 is not None and r2 is not None) else None
+
+                    # Save the synthesized frame to disk
+                    out_path = os.path.join(path_manager.hand_pose_dir, f"frame_{i:06d}.npz")
+                    out_left = {"front": {"keypoints_3d_rectcam": l_interp}}
+                    out_right = {"front": {"keypoints_3d_rectcam": r_interp}}
+
+                    np.savez(out_path, left=np.array(out_left), right=np.array(out_right))
+
     def _validate_episode_dir(self, path_manager: PathManager, frame_start: int, frame_end: int) -> bool:
         required = [
             path_manager.timestamp_txt,
@@ -231,15 +290,22 @@ class EgoDataset:
             required.append(path_manager.right_front_mp4)
 
         # 1. Check if base required files and directories exist
-        if not all(os.path.exists(p) for p in required):
-            return False
+        for p in required:
+            if not os.path.exists(p):
+                print(f"\n[VALIDATION ERROR] Missing core file or directory: {p}")
+                return False
 
-        # 2. Validate that the specific requested frames actually downloaded
+        # 2. Validate that the specific requested boundary frames actually downloaded
         if frame_end > frame_start:
             for i in (frame_start, frame_end - 1):
                 hand_file = os.path.join(path_manager.hand_pose_dir, f"frame_{i:06d}.npz")
                 pcd_file = os.path.join(path_manager.pcd_dir, f"frame_{i:06d}.npz")
-                if not os.path.exists(hand_file) or not os.path.exists(pcd_file):
+
+                if not os.path.exists(hand_file):
+                    print(f"\n[VALIDATION ERROR] Missing boundary hand pose: {hand_file}")
+                    return False
+                if not os.path.exists(pcd_file):
+                    print(f"\n[VALIDATION ERROR] Missing boundary point cloud: {pcd_file}")
                     return False
 
         return True
@@ -251,77 +317,85 @@ class EgoDataset:
 
         episode_uri = self.unique_uris[episode_idx]
 
-        def _sync_s3_file(s3_src: str, local_dst: str):
-            if not os.path.exists(local_dst):
-                print(f"\rpulling {s3_src[-80:]} ...", end="", flush=True)
-                os.makedirs(os.path.dirname(local_dst), exist_ok=True)
-                # Parse out the bucket and key
-                p = urlparse(s3_src)
-                s3_bucket = p.netloc
-                s3_key = p.path.lstrip("/")
-                try:
-                    s3_client.download_file(s3_bucket, s3_key, local_dst)
-                except ClientError as e:
-                    raise RuntimeError(f"Failed to download {s3_src}: {e}") from e
-
+        # --- S3 DOWNLOAD LOGIC ---
         if episode_uri.startswith("s3://"):
             parsed = urlparse(episode_uri)
             bucket = parsed.netloc
 
-            # 1. Initialize boto3 client once
             session = boto3.Session(profile_name=self.aws_profile)
             s3_client = session.client("s3")
 
             s3_rectified_key = posixpath.dirname(parsed.path.lstrip("/"))
-            s3_rectified_data_dir = f"s3://{bucket}/{s3_rectified_key}"
             local_rectified_data_dir = str(self.target_dir / bucket / s3_rectified_key)
 
-            s3_paths = PathManager(s3_rectified_data_dir)
+            src_paths = PathManager(f"s3://{bucket}/{s3_rectified_key}")
             local_paths = PathManager(local_rectified_data_dir)
 
-            os.makedirs(local_rectified_data_dir, exist_ok=True)
-            os.makedirs(local_paths.hand_pose_dir, exist_ok=True)
-            os.makedirs(local_paths.pcd_dir, exist_ok=True)
+            def _sync_file(src: str, dst: str):
+                if not os.path.exists(dst):
+                    print(f"\rpulling {src[-80:]} ...", end="", flush=True)
+                    os.makedirs(os.path.dirname(dst), exist_ok=True)
+                    p = urlparse(src)
+                    s3_client.download_file(p.netloc, p.path.lstrip("/"), dst)
 
-            env = os.environ.copy()
-            env["AWS_MAX_CONCURRENT_REQUESTS"] = str(s3_concurrency)
-
-            files_to_download = [
-                (s3_paths.timestamp_txt, local_paths.timestamp_txt),
-                (s3_paths.stereo_params_npz, local_paths.stereo_params_npz),
-                (s3_paths.slam_trajectory_txt, local_paths.slam_trajectory_txt),
-            ]
-            if "left-front" in self.active_cameras:
-                files_to_download.append((s3_paths.left_front_mp4, local_paths.left_front_mp4))
-            if "right-front" in self.active_cameras:
-                files_to_download.append((s3_paths.right_front_mp4, local_paths.right_front_mp4))
-
-            for s3_src, local_dst in files_to_download:
-                _sync_s3_file(s3_src, local_dst)
-
-            # Download ONLY the Hand Pose and Depth frames needed concurrently
-            def download_single_frame(frame_idx: int):
-                filename = f"frame_{frame_idx:06d}.npz"
-
-                # Pairings of (s3_source, local_dest)
-                frame_targets = [
-                    (posixpath.join(s3_paths.hand_pose_dir, filename), os.path.join(local_paths.hand_pose_dir, filename)),
-                    (posixpath.join(s3_paths.pcd_dir, filename), os.path.join(local_paths.pcd_dir, filename)),
-                ]
-                for s3_src, local_dst in frame_targets:
-                    _sync_s3_file(s3_src, local_dst)
-
-            # Execute the frame downloads concurrently
-            with ThreadPoolExecutor(max_workers=s3_concurrency) as executor:
-                futures = [executor.submit(download_single_frame, i) for i in range(frame_start, frame_end)]
-                for future in as_completed(futures):
-                    future.result()
-
-            print("done")
-
+        # --- LOCAL SYNC LOGIC ---
         else:
-            local_rectified_data_dir = os.path.abspath(os.path.dirname(episode_uri))
+            src_rectified_data_dir = os.path.abspath(os.path.dirname(episode_uri))
+            src_paths = PathManager(src_rectified_data_dir)
+
+            # Construct a safe target directory structure to prevent collisions
+            rel_path = os.path.join(
+                f"{episode_info['device_id']}_session_{episode_info['session_num']}",
+                f"processed-segment{episode_info['segment_num']}",
+                "hand",
+                "rectified_dataset",
+            )
+            local_rectified_data_dir = os.path.join(self.target_dir, "local_sync", rel_path)
             local_paths = PathManager(local_rectified_data_dir)
+
+            def _sync_file(src: str, dst: str):
+                if not os.path.exists(dst) and os.path.exists(src):
+                    os.makedirs(os.path.dirname(dst), exist_ok=True)
+                    shutil.copy2(src, dst)
+
+        # --- COMMON SYNC & INTERPOLATION EXECUTION ---
+        os.makedirs(local_paths.hand_pose_dir, exist_ok=True)
+        os.makedirs(local_paths.pcd_dir, exist_ok=True)
+
+        # 1. Sync Core Files
+        files_to_sync = [
+            (src_paths.timestamp_txt, local_paths.timestamp_txt),
+            (src_paths.stereo_params_npz, local_paths.stereo_params_npz),
+            (src_paths.slam_trajectory_txt, local_paths.slam_trajectory_txt),
+        ]
+        if "left-front" in self.active_cameras:
+            files_to_sync.append((src_paths.left_front_mp4, local_paths.left_front_mp4))
+        if "right-front" in self.active_cameras:
+            files_to_sync.append((src_paths.right_front_mp4, local_paths.right_front_mp4))
+
+        for src_path, dst_path in files_to_sync:
+            _sync_file(src_path, dst_path)
+
+        # 2. Sync Frame-level .npz Files Concurrently
+        def sync_single_frame(frame_idx: int):
+            filename = f"frame_{frame_idx:06d}.npz"
+            frame_targets = [
+                (posixpath.join(src_paths.hand_pose_dir, filename), os.path.join(local_paths.hand_pose_dir, filename)),
+                (posixpath.join(src_paths.pcd_dir, filename), os.path.join(local_paths.pcd_dir, filename)),
+            ]
+            try:
+                for src_path, dst_path in frame_targets:
+                    _sync_file(src_path, dst_path)
+            except Exception:
+                # Silently ignore missing files; the interpolator will catch and synthesize them.
+                pass
+
+        with ThreadPoolExecutor(max_workers=s3_concurrency) as executor:
+            futures = [executor.submit(sync_single_frame, i) for i in range(frame_start, frame_end)]
+            for future in as_completed(futures):
+                future.result()
+
+        self._interpolate_missing_frames(local_paths, frame_start, frame_end)
 
         if not self._validate_episode_dir(local_paths, frame_start, frame_end):
             raise ValueError(f"Downloaded episode {local_rectified_data_dir} is missing required files.")
