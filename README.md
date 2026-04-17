@@ -43,14 +43,20 @@ from grounded.data.visualize import visualize_episode_to_mp4
 INDEX_JSON = "index.json"  # change this to your path
 EPISODE_IDX = 0
 
-# initialize dataset
-# you target_dir defaults to your cache, so make sure to change this for each dataset
-dataset = EgoDataset("index.json", aws_profile="grounded", active_cameras=["left-front", "right-front"], min_duration_sec=2)
-print(f"Found {len(dataset)} episodes")
-
-# initialize episode
-episode: EgoEpisode = dataset[EPISODE_IDX]  # this will download it internally if it's missing
-
-# visualize episode
-visualize_episode_to_mp4(episode, downsample=4, fps=30, output_path="test.mp4")
+dataset = EgoDataset(
+    index_path=INDEX_JSON,
+    active_cameras=["left-front", "right-front", "left-eye", "right-eye"],
+    target_dir="~/.cache/grounded/data",
+    min_duration_sec=4,
+)
+os.makedirs("outputs/", exist_ok=True)
+episode = dataset[EPISODE_IDX]
+visualize_episode_to_mp4(
+    episode=episode,
+    output_path=f"outputs/sdkvis{EPISODE_IDX}.mp4",
+    downsample=4,
+    fps=30,
+    max_workers=16,
+    max_depth=5,
+)
 ```

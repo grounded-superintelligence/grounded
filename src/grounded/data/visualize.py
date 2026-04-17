@@ -1,17 +1,26 @@
 #!/usr/bin/env python3
-import argparse
-import os
+from concurrent.futures import ThreadPoolExecutor
 
 import cv2
 import numpy as np
 from tqdm import tqdm
 
-from grounded.data.ego_dataset import GROUNDED_DIR_DEFAULT, EgoDataset, EgoEpisode
+from grounded.data.ego_dataset import EgoEpisode
 
 # --- Drawing Constants & Helpers ---
 LEFT_HAND_COLOR = (165, 255, 100)
 RIGHT_HAND_COLOR = (255, 100, 200)
 JOINTS_COLOR = (255, 255, 255)
+
+
+def transform_points(points_3d: np.ndarray, T: np.ndarray):
+    """Applies a 4x4 homogenous transformation matrix to 3D points."""
+    if points_3d is None or len(points_3d) == 0:
+        return points_3d
+    ones = np.ones((points_3d.shape[0], 1), dtype=points_3d.dtype)
+    points_3d_h = np.concatenate([points_3d, ones], axis=-1)
+    transformed_h = (T @ points_3d_h.T).T
+    return transformed_h[:, :3]
 
 
 def project_points(points_3d: np.ndarray, P: np.ndarray):
@@ -89,35 +98,6 @@ def draw_uv_points(image: np.ndarray, uvs: np.ndarray, is_right: bool):
 # --- Depth Processing Helpers ---
 
 
-def get_global_depth_bounds(episode: EgoEpisode, max_percentile: float = 90.0):
-    """Scans the episode to find the absolute min and percentile max valid depth values."""
-    global_min = float("inf")
-    samples = []
-
-    for i in tqdm(range(len(episode)), desc="Finding depth bounds", leave=False):
-        d = episode[i].left_depth
-        if d is not None:
-            valid = d[d > 0]
-            if len(valid) > 0:
-                global_min = min(global_min, valid.min())
-                # Subsample (1 out of every 20 pixels) to keep memory usage safe across long episodes
-                samples.append(valid[::20])
-
-    if global_min == float("inf") or not samples:
-        print("Warning: No valid depth data found in the episode. Using dummy bounds.")
-        return 0.0, 1.0
-
-    # Cast to float32 to prevent numpy float16 overflow bugs during percentile calculation
-    all_samples = np.concatenate(samples).astype(np.float32)
-    global_max = float(np.percentile(all_samples, max_percentile))
-
-    # Safety catch: if max somehow equals min (e.g., flat depth map), pad it to avoid div by zero
-    if not np.isfinite(global_max) or global_max <= global_min:
-        global_max = global_min + 1.0
-
-    return global_min, global_max
-
-
 def warp_left_depth_to_right(left_depth: np.ndarray, P1: np.ndarray, P2: np.ndarray) -> np.ndarray:
     """Forward-warps a rectified left depth map to the right camera view."""
     H, W = left_depth.shape
@@ -150,46 +130,51 @@ def warp_left_depth_to_right(left_depth: np.ndarray, P1: np.ndarray, P2: np.ndar
     right_depth[y_right, x_right] = z_val
     right_depth[right_depth == np.inf] = 0
 
-    # Note: Removed the cv2.morphologyEx morphological close step.
-    # Missing projections will stay exactly 0 (which colorizes to black).
     return right_depth
 
 
 def colorize_normalized_depth(depth: np.ndarray, vmin: float, vmax: float) -> np.ndarray:
     """Normalizes a depth map against global bounds and applies a colormap."""
-    # Prevent division by zero if vmin == vmax
     if vmax <= vmin:
         vmax = vmin + 1e-5
 
-    # 1. Identify missing pixels BEFORE clipping alters their values
     missing_mask = depth == 0
 
-    # 2. Clip and normalize
     depth_clipped = np.clip(depth, a_min=vmin, a_max=vmax)
     norm = (depth_clipped - vmin) / (vmax - vmin)
     norm = np.clip(norm, 0, 1)
     norm = 1.0 - norm  # Invert so closer is hotter
 
-    # Ensure there are no NaNs bleeding through before casting to uint8
     norm = np.nan_to_num(norm, nan=0.0)
 
-    # 3. Apply colormap
     norm_8u = (norm * 255).astype(np.uint8)
     colorized = cv2.applyColorMap(norm_8u, cv2.COLORMAP_INFERNO)
-
-    # 4. Force missing pixels to pure black using the saved mask
     colorized[missing_mask] = 0
 
     return colorized
 
 
+def ensure_depth_size(depth: np.ndarray, img_shape: tuple) -> np.ndarray:
+    """Resizes depth map to match RGB dimensions if needed."""
+    if depth is None:
+        return None
+    h, w = img_shape[:2]
+    if depth.shape[:2] != (h, w):
+        return cv2.resize(depth, (w, h), interpolation=cv2.INTER_NEAREST)
+    return depth
+
+
 # --- Visualization Routines ---
 
 
-def visualize_episode_to_mp4(episode: EgoEpisode, output_path: str, downsample: int = 2, fps: float = 30.0):
-    """
-    Renders an EgoEpisode object with canonical 2D keypoint projections and tiled depth maps.
-    """
+def visualize_episode_to_mp4(
+    episode: EgoEpisode,
+    output_path: str,
+    downsample: int = 2,
+    fps: float = 30.0,
+    max_workers: int = 4,
+    max_depth: float = 20.0,
+):
     if len(episode) == 0:
         print("Error: The provided episode is empty.")
         return
@@ -197,45 +182,90 @@ def visualize_episode_to_mp4(episode: EgoEpisode, output_path: str, downsample: 
     out_path = output_path if output_path.endswith(".mp4") else f"{output_path}.mp4"
     writer = None
 
-    # Pass 1: Global Bounds for consistent depth coloring across the video
-    vmin, vmax = get_global_depth_bounds(episode, max_percentile=90.0)
+    # Use fixed bounds instead of precomputing
+    vmin, vmax = 0.0, max_depth
 
-    # Pass 2: Render Video
-    for i in tqdm(range(len(episode)), desc="Rendering Video", leave=False):
+    # Frame processing function for mapping over executor
+    def _process_frame(i):
         frame = episode[i]
         params = frame.stereo_params
 
-        # Prepare depths for active cameras
-        left_depth = frame.left_depth
-        rgb_h, rgb_w = frame.left_rgb.shape[:2]
-        if left_depth.shape[:2] != (rgb_h, rgb_w):
-            left_depth = cv2.resize(left_depth, (rgb_w, rgb_h), interpolation=cv2.INTER_NEAREST)
-
-        right_depth = None
-        if "right-front" in episode.active_cameras:
-            right_depth = warp_left_depth_to_right(
-                left_depth,
-                params["front_P1"],
-                params["front_P2"],
-            )
-
         cam_configs = []
-        if "left-front" in episode.active_cameras:
+
+        # --- Process Front Cameras ---
+        left_front_depth = (
+            ensure_depth_size(frame.left_front_depth, frame.left_front_rgb.shape) if frame.left_front_rgb is not None else None
+        )
+
+        if "left-front" in episode.active_cameras and frame.left_front_rgb is not None:
             cam_configs.append(
                 {
-                    "img": frame.left_rgb,
+                    "img": frame.left_front_rgb,
                     "P": params["front_P1"],
-                    "depth": left_depth,
+                    "depth": left_front_depth,
                     "transform": lambda pts: pts,
                 }
             )
-        if "right-front" in episode.active_cameras:
+
+        if "right-front" in episode.active_cameras and frame.right_front_rgb is not None:
+            right_front_depth = None
+            if left_front_depth is not None:
+                right_front_depth = warp_left_depth_to_right(left_front_depth, params["front_P1"], params["front_P2"])
             cam_configs.append(
                 {
-                    "img": frame.right_rgb,
+                    "img": frame.right_front_rgb,
                     "P": params["front_P2"],
-                    "depth": right_depth,
+                    "depth": right_front_depth,
                     "transform": lambda pts: pts,
+                }
+            )
+
+        # --- Process Eye Cameras ---
+        left_eye_depth = (
+            ensure_depth_size(frame.left_eye_depth, frame.left_eye_rgb.shape) if frame.left_eye_rgb is not None else None
+        )
+
+        T_f2e_unrect = params.get("T_front_to_eye")
+        if T_f2e_unrect is not None:
+            # 1. Inverse of Front Rectification
+            R_front_4x4 = np.eye(4)
+            R_front_4x4[:3, :3] = params["front_R1"]
+            R_front_inv = np.linalg.inv(R_front_4x4)
+
+            # 2. Eye Rectification
+            R_eye_4x4 = np.eye(4)
+            R_eye_4x4[:3, :3] = params["eye_R1"]
+
+            # Combine: Un-rectify Front -> Extrinsics to Eye -> Rectify Eye
+            T_rectfront_to_recteye = R_eye_4x4 @ T_f2e_unrect @ R_front_inv
+
+            def eye_transform(pts):
+                return transform_points(pts, T_rectfront_to_recteye)
+        else:
+
+            def eye_transform(pts):
+                return pts
+
+        if "left-eye" in episode.active_cameras and frame.left_eye_rgb is not None:
+            cam_configs.append(
+                {
+                    "img": frame.left_eye_rgb,
+                    "P": params["eye_P1"],
+                    "depth": left_eye_depth,
+                    "transform": eye_transform,
+                }
+            )
+
+        if "right-eye" in episode.active_cameras and frame.right_eye_rgb is not None:
+            right_eye_depth = None
+            if left_eye_depth is not None:
+                right_eye_depth = warp_left_depth_to_right(left_eye_depth, params["eye_P1"], params["eye_P2"])
+            cam_configs.append(
+                {
+                    "img": frame.right_eye_rgb,
+                    "P": params["eye_P2"],
+                    "depth": right_eye_depth,
+                    "transform": eye_transform,
                 }
             )
 
@@ -263,77 +293,72 @@ def visualize_episode_to_mp4(episode: EgoEpisode, output_path: str, downsample: 
                 r_kps2d = project_points(r_pts, P)
                 img_bgr = draw_uv_skeleton(draw_uv_points(img_bgr, r_kps2d, True), r_kps2d, True)
 
-            # Colorize Depth
-            depth_color = colorize_normalized_depth(depth_raw, vmin, vmax)
-
-            # Ensure depth shape strictly matches image shape before hstack
-            if depth_color.shape[:2] != img_bgr.shape[:2]:
-                depth_color = cv2.resize(depth_color, (img_bgr.shape[1], img_bgr.shape[0]))
+            # Handle Depth
+            if depth_raw is not None:
+                depth_color = colorize_normalized_depth(depth_raw, vmin, vmax)
+                if depth_color.shape[:2] != img_bgr.shape[:2]:
+                    depth_color = cv2.resize(depth_color, (img_bgr.shape[1], img_bgr.shape[0]))
+            else:
+                depth_color = np.zeros_like(img_bgr)
 
             # Tile: [RGB with Overlays | Depth Map]
             row = np.hstack([img_bgr, depth_color])
             processed_rows.append(row)
 
         if not processed_rows:
-            continue
+            return None
 
-        # Vertically stack all active cameras
         stacked = np.vstack(processed_rows)
 
-        # Downsample the entire combined image block
         if downsample > 1:
             h, w = stacked.shape[:2]
             new_w = w // downsample
             new_h = int(h * (new_w / w))
             stacked = cv2.resize(stacked, (new_w, new_h))
 
-        # Initialize VideoWriter dynamically based on final stacked frame size
-        if writer is None:
-            target_h, target_w = stacked.shape[:2]
-            writer = cv2.VideoWriter(out_path, cv2.VideoWriter_fourcc(*"mp4v"), fps, (target_w, target_h))
+        if hasattr(episode, "caption") and episode.caption:
+            caption_text = f"Caption: {episode.caption}"
 
-        writer.write(stacked)
+            # Setup font configurations
+            font = cv2.FONT_HERSHEY_SIMPLEX
+            font_scale = 0.8
+            thickness = 2
+
+            # Retrieve text bounds for the background rectangle
+            (text_width, text_height), baseline = cv2.getTextSize(caption_text, font, font_scale, thickness)
+
+            # Position the text at the bottom left
+            margin = 15
+            x = margin
+            y = stacked.shape[0] - margin - baseline
+
+            # Draw semi-transparent background via overlay (alpha blending)
+            overlay = stacked.copy()
+            cv2.rectangle(overlay, (x - 5, y - text_height - 5), (x + text_width + 5, y + baseline + 5), (0, 0, 0), -1)
+            cv2.addWeighted(overlay, 0.6, stacked, 0.4, 0, stacked)
+
+            # Draw the actual text on top
+            cv2.putText(stacked, caption_text, (x, y), font, font_scale, (255, 255, 255), thickness, cv2.LINE_AA)
+
+        return stacked
+
+    # Render Video
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        # map guarantees results are returned in the original sequential order
+        rendered_frames = executor.map(_process_frame, range(len(episode)))
+
+        for stacked in tqdm(rendered_frames, total=len(episode), desc="Rendering Video", leave=False):
+            if stacked is None:
+                continue
+
+            if writer is None:
+                target_h, target_w = stacked.shape[:2]
+                writer = cv2.VideoWriter(out_path, cv2.VideoWriter_fourcc(*"mp4v"), fps, (target_w, target_h))
+
+            writer.write(stacked)
 
     if writer is not None:
         writer.release()
         print(f"Saved to {out_path}")
     else:
         print("Error: No frames were written to the video.")
-
-
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--index_json", type=str, required=True)
-    parser.add_argument("--dataset_dir", type=str, default=GROUNDED_DIR_DEFAULT)
-    parser.add_argument("--profile", type=str, default=None, help="AWS profile to use for downloading")
-    parser.add_argument("--downsample", type=int, default=2)
-    parser.add_argument("--fps", type=float, default=30.0)
-    args = parser.parse_args()
-
-    print(f"Loading dataset from {args.index_json}...")
-
-    dataset = EgoDataset(
-        index_path=args.index_json,
-        active_cameras=["left-front", "right-front"],
-        aws_profile=args.profile,
-        target_dir=args.dataset_dir,
-        min_duration_sec=2,
-    )
-
-    os.makedirs("outputs/", exist_ok=True)
-    for episode_idx in range(10):
-        if episode_idx >= len(dataset):
-            break
-
-        episode = dataset[episode_idx]
-
-        visualize_episode_to_mp4(
-            episode=episode,
-            output_path=f"outputs/sdkvis{episode_idx}.mp4",
-            downsample=args.downsample,
-            fps=args.fps,
-        )
-
-
-if __name__ == "__main__":
-    main()
