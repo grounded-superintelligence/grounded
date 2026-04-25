@@ -24,15 +24,6 @@ conda activate grounded
 python -m pip install git+https://github.com/grounded-superintelligence/grounded.git
 ```
 
-Install the AWS CLI binary
-```bash
-sudo apt update && sudo apt install unzip curl -y
-curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
-unzip awscliv2.zip
-sudo ./aws/install
-rm -rf awscliv2.zip aws/
-```
-
 ## usage
 You should be given an `index.json` and `credentials` that corresponds your proprietary dataset. Add the contents of `credentials` to your `~/.aws/credentials` file. Below is a basic snippet of the basic modules present in `grounded` SDK:
 

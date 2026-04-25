@@ -15,12 +15,12 @@ dependencies = [
     "opencv-python",
     "boto3",
     "botocore[crt]",
+    "boto3-stubs[s3]",
     "tqdm",
 ]
 
 [project.optional-dependencies]
 dev = [
-    "boto3-stubs[s3]",
     "pre-commit",
     "ruff",
 ]
