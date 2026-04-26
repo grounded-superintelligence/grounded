@@ -1,3 +1,7 @@
+"""
+A simple dataset abstraction over GSI data
+"""
+
 import json
 import os
 import posixpath
@@ -5,7 +9,7 @@ import shutil
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional, Union
+from typing import List, Optional, Union
 from urllib.parse import urlparse
 
 import boto3
@@ -13,6 +17,7 @@ import botocore
 import cv2
 import filelock
 import numpy as np
+from scipy.spatial.transform import Rotation as R
 from torch.utils.data import Dataset
 from tqdm.auto import tqdm
 
@@ -29,7 +34,6 @@ class FrameData:
     right_front_rgb: Optional[np.ndarray]
     left_eye_rgb: Optional[np.ndarray]
     right_eye_rgb: Optional[np.ndarray]
-    stereo_params: Dict[str, np.ndarray]
     left_hand_kp: Optional[np.ndarray]
     right_hand_kp: Optional[np.ndarray]
     left_front_depth: Optional[np.ndarray]
@@ -396,7 +400,10 @@ class CacheManager:
 class EgoEpisode(Dataset):
     """A pure data-reading representation of a single episode interval."""
 
-    CAMS = ["left-front", "right-front", "left-eye", "right-eye"]
+    LEFT_FRONT_WH = (1920, 1080)
+    RIGHT_FRONT_WH = (1920, 1080)
+    LEFT_EYE_WH = (1920, 1080)
+    RIGHT_EYE_WH = (1920, 1080)
 
     def __init__(
         self,
@@ -413,19 +420,33 @@ class EgoEpisode(Dataset):
         self.active_cameras = active_cameras
         self.caption = caption
 
-        assert set(active_cameras).issubset(set(self.CAMS))
-
         stereo_npz = np.load(self.path_manager.stereo_params_npz, allow_pickle=True)
         self.stereo_params = {key: stereo_npz[key] for key in stereo_npz.files}
 
         with open(self.path_manager.timestamp_txt, "r") as f:
             self.timestamps = f.read().strip().split("\n")
 
+        # load raw c2w poses
         traj_data = np.loadtxt(self.path_manager.slam_trajectory_txt, comments="#")
         if traj_data.ndim == 1:
             traj_data = traj_data[None, :]
         self.c2w_timestamps = (traj_data[:, 0] * 1e9).astype(np.int64)
-        self.c2w_poses = traj_data[:, 1:]
+        unrect_c2w_poses = traj_data[:, 1:]
+
+        # NOTE: c2w poses are computed on the *unrectified* left-front camera
+        # all the per-frame data (depth, hand keypoints, point clouds) lives
+        # in the *rectified* left camera frame
+        #
+        # convert the pose so it can be applied directly to rect-frame points:
+        #     world_from_rect = world_from_unrect @ unrect_from_rect
+        # where unrect_from_rect is a pure rotation R1.T (R1 from cv2.stereoRectify).
+        R1 = np.asarray(self.stereo_params["front_R1"])
+        R_unrect_from_rect = R.from_matrix(R1.T)
+        rot_unrect = R.from_quat(unrect_c2w_poses[:, 3:])
+        rot_rect = rot_unrect * R_unrect_from_rect
+        t_rect = unrect_c2w_poses[:, :3]
+        q_rect = rot_rect.as_quat()
+        self.c2w_poses = np.concatenate([t_rect, q_rect], axis=1)
 
     def _load_hand_streams(self, global_frame: int):
         filepath = os.path.join(self.path_manager.hand_pose_dir, f"frame_{global_frame:06d}.npz")
@@ -482,7 +503,6 @@ class EgoEpisode(Dataset):
             right_front_rgb=imgs.get("right-front"),
             left_eye_rgb=imgs.get("left-eye"),
             right_eye_rgb=imgs.get("right-eye"),
-            stereo_params=self.stereo_params,
             left_hand_kp=l_front,
             right_hand_kp=r_front,
             left_front_depth=left_front_depth,
@@ -497,6 +517,8 @@ class EgoDataset(Dataset):
     Maps indices to cached episodes using the CacheManager.
     """
 
+    CAMS = ["left-front", "right-front", "left-eye", "right-eye"]
+
     def __init__(
         self,
         index_path: str,
@@ -508,7 +530,11 @@ class EgoDataset(Dataset):
         fps: float = 30.0,
     ):
         self.index_path = Path(index_path).expanduser()
-        self.active_cameras = active_cameras or ["left-front", "right-front"]
+        self.active_cameras = active_cameras
+        assert set(active_cameras).issubset(set(self.CAMS)) and len(active_cameras) > 0, (
+            f"active_cameras must be one of {self.CAMS}"
+        )
+
         self.cache_manager = CacheManager(target_dir=target_dir, aws_profile=aws_profile, active_cameras=self.active_cameras)
 
         if not self.index_path.exists():

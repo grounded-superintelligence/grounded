@@ -13,9 +13,11 @@ requires-python = ">=3.10"
 dependencies = [
     "numpy>2",
     "opencv-python",
+    "scipy",
     "boto3",
     "botocore[crt]",
     "boto3-stubs[s3]",
+    "rerun-sdk",
     "tqdm",
 ]
 
