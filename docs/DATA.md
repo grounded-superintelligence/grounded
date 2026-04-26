@@ -45,7 +45,7 @@ Calibration was performed in the **unrectified** camera, while the image streams
 | `front_Q`         | `(4, 4)` | Disparity-to-depth reprojection matrix of the rectified`left-front` camera that maps: pixel + disparity ➝ 3D point |
 | `front_baseline`  | `scalar` | Stereo baseline of the front pair, equivalent to `-P2[0,3] / P2[0,0]` |
 | `eye_P1`          | `(3, 4)` | Projection matrix of that maps a 3D point in the rectified `left-eye` frame to homogeneous pixel coordinates |
-| `eye_P2`          | `(3, 4)` | Projection matrix of the rectified `right-eye` camera, expressed in the rectified `left-eye` camera. Has the form `[K \| −K·b]` with `b = [baseline, 0, 0]ᵀ` and `baseline = -P2[0,3] / P2[0,0]` |
+| `eye_P2`          | `(3, 4)` | Projection matrix of the rectified `right-eye` camera, expressed in the rectified `left-eye` camera. Has the form `[K \| −K·b]` with `b = [baseline, 0, 0]ᵀ` |
 | `eye_R1`          | `(3, 3)` | Rotation matrix that rectifies the `left-eye` camera |
 | `eye_R2`          | `(3, 3)` | Rotation matrix that rectifies the `right-eye` camera |
 | `eye_Q`           | `(4, 4)` | Disparity-to-depth reprojection matrix of the rectified`left-eye` camera that maps: pixel + disparity ➝ 3D point |
