@@ -62,3 +62,5 @@ visualize_episode_to_rerun(
     output_path=f"outputs/sdkvis{EPISODE_IDX}.rrd",
 )
 ```
+
+Refer to `docs/DATA.md` for the exact specifications of all parameters used in this library.
