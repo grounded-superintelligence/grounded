@@ -578,9 +578,13 @@ class EgoDataset(Dataset):
                     print(f"Download exception: {exc}")
 
     def get_caption(self, idx: int) -> Optional[str]:
-        """Returns the caption for episode `idx`, or None if no caption is available."""
+        """
+        Returns the caption for episode `idx`, or None if no caption is available.
+
+        See `docs/DATA.md` for more details on key naming convention
+        """
         if not self.captions_map:
-            return None
+            return
 
         ep = self.index[idx]
         key = f"{ep['device_id']}_interval_{ep['frame_start']}_{ep['frame_end']}"

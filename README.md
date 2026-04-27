@@ -46,6 +46,10 @@ episode = dataset[EPISODE_IDX]
 
 os.makedirs("outputs/", exist_ok=True)
 
+# print caption
+print(dataset.get_caption(EPISODE_IDX))
+# print(dataset[EPISODE_IDX].caption)  # alternate way to get caption, but will download all episode files
+
 # generate mp4 render
 visualize_episode_to_mp4(
     episode=episode,

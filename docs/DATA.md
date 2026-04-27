@@ -51,3 +51,24 @@ Calibration was performed in the **unrectified** camera, while the image streams
 | `eye_Q`           | `(4, 4)` | Disparity-to-depth reprojection matrix of the rectified`left-eye` camera that maps: pixel + disparity ➝ 3D point |
 | `eye_baseline`    | `scalar` | Stereo baseline of the eye pair, equivalent to `-P2[0,3] / P2[0,0]` |
 | `T_front_to_eye`  | `(4, 4)` | Extrinsic calibration matrix that maps unrectified `left-front` to unrectified `left-eye` |
+
+
+## `episode.caption`
+
+A short, optional natural-language description of the manipulation action shown in the episode. Returns None when the dataset was constructed without a captions_path, or when no caption was found for this particular episode.
+```python
+dataset = EgoDataset(index_path=..., captions_path="ego_captions.jsonl", active_cameras=["left-front"])
+print(dataset.get_caption(42))  # "pick up the yellow plastic spray bottle and place it on the wooden shelf"
+```
+
+Captions live in a JSONL file. Each line is a JSON object mapping one or more episode keys to caption strings.
+```jsonl
+{"af2f0ac61d4f308a_interval_7331_7423": "pick up the white container and place it on the shelf"}
+{"af2f0ac61d4f308a_interval_7469_7551": "pick up the metal box and place the metal box on the shelf"}
+```
+
+Each episode key has the form
+```
+{device_id}_{session}_{segment}_{frame_start}_{frame_end}
+```
+This is an internal naming convention derived from how the data is collected.
