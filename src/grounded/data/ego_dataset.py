@@ -552,10 +552,7 @@ class EgoDataset(Dataset):
             with open(Path(captions_path).expanduser(), "r") as f:
                 for line in f:
                     if line.strip():
-                        try:
-                            self.captions_map.update(json.loads(line))
-                        except json.JSONDecodeError:
-                            pass
+                        self.captions_map.update(json.loads(line))
 
         self.index = []
         for episode in raw_index:
@@ -581,21 +578,13 @@ class EgoDataset(Dataset):
                     print(f"Download exception: {exc}")
 
     def get_caption(self, idx: int) -> Optional[str]:
+        """Returns the caption for episode `idx`, or None if no caption is available."""
         if not self.captions_map:
             return None
 
         ep = self.index[idx]
-        long_key = (
-            f"{ep['device_id']}"
-            f"_session_{ep['session_num']}"
-            f"_segment_{ep['segment_num']}"
-            f"_interval_{ep['frame_start']}_{ep['frame_end']}"
-        )
-        if long_key in self.captions_map:
-            return self.captions_map[long_key]
-
-        short_key = f"{ep['device_id']}_interval_{ep['frame_start']}_{ep['frame_end']}"
-        return self.captions_map.get(short_key)
+        key = f"{ep['device_id']}_interval_{ep['frame_start']}_{ep['frame_end']}"
+        return self.captions_map.get(key)
 
     def __len__(self):
         return len(self.index)
