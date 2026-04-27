@@ -25,7 +25,7 @@ python -m pip install git+https://github.com/grounded-superintelligence/grounded
 ```
 
 ## usage
-You should be given an `index.json` and `credentials` that corresponds your proprietary dataset. Add the contents of `credentials` to your `~/.aws/credentials` file. Below is a basic snippet of the basic modules present in `grounded` SDK:
+You should be given an `index.json`, `captions.jsonl`, and `credentials` that corresponds your proprietary dataset. Add the contents of `credentials` to your `~/.aws/credentials` file. Below is a basic snippet of the basic modules present in `grounded` SDK:
 
 ```python
 from grounded.data.ego_dataset import EgoDataset, EgoEpisode
@@ -33,11 +33,13 @@ from grounded.data.visualize import visualize_episode_to_mp4
 from grounded.data.visualize_3d import visualize_episode_to_rerun
 
 INDEX_JSON = "index.json"  # change this to your path
+CAPTIONS_JSONL = "captions.jsonl"  # change this to your path
 EPISODE_IDX = 0
 
 # load dataset & episode
 dataset = EgoDataset(
     index_path=INDEX_JSON,
+    captions_path=CAPTIONS_JSONL,
     active_cameras=["left-front", "right-front", "left-eye", "right-eye"],
     target_dir="~/.cache/grounded/data",
     min_duration_sec=4,
