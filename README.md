@@ -24,33 +24,33 @@ conda activate grounded
 python -m pip install git+https://github.com/grounded-superintelligence/grounded.git
 ```
 
-Install the AWS CLI binary
-```bash
-sudo apt update && sudo apt install unzip curl -y
-curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
-unzip awscliv2.zip
-sudo ./aws/install
-rm -rf awscliv2.zip aws/
-```
-
 ## usage
 You should be given an `index.json` and `credentials` that corresponds your proprietary dataset. Add the contents of `credentials` to your `~/.aws/credentials` file. Below is a basic snippet of the basic modules present in `grounded` SDK:
 
 ```python
 from grounded.data.ego_dataset import EgoDataset, EgoEpisode
 from grounded.data.visualize import visualize_episode_to_mp4
+from grounded.data.visualize_3d import visualize_episode_to_rerun
 
 INDEX_JSON = "index.json"  # change this to your path
 EPISODE_IDX = 0
 
+# load dataset & episode
 dataset = EgoDataset(
     index_path=INDEX_JSON,
     active_cameras=["left-front", "right-front", "left-eye", "right-eye"],
     target_dir="~/.cache/grounded/data",
     min_duration_sec=4,
 )
-os.makedirs("outputs/", exist_ok=True)
 episode = dataset[EPISODE_IDX]
+
+os.makedirs("outputs/", exist_ok=True)
+
+# print caption
+print(dataset.get_caption(EPISODE_IDX))
+# print(dataset[EPISODE_IDX].caption)  # alternate way to get caption, but will download all episode files
+
+# generate mp4 render
 visualize_episode_to_mp4(
     episode=episode,
     output_path=f"outputs/sdkvis{EPISODE_IDX}.mp4",
@@ -59,4 +59,12 @@ visualize_episode_to_mp4(
     max_workers=16,
     max_depth=5,
 )
+
+# generate rerun 3d
+visualize_episode_to_rerun(
+    episode=episode,
+    output_path=f"outputs/sdkvis{EPISODE_IDX}.rrd",
+)
 ```
+
+Refer to `docs/DATA.md` for the exact specifications of all parameters used in this library.
