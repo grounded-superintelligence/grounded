@@ -40,7 +40,7 @@ EPISODE_IDX = 0
 dataset = EgoDataset(
     index_path=INDEX_JSON,
     captions_path=CAPTIONS_JSONL,
-    active_cameras=["left-front", "right-front", "left-eye", "right-eye"],
+    active_cameras=["left-front", "right-front"],
     target_dir="~/.cache/grounded/data",
     min_duration_sec=4,
 )
