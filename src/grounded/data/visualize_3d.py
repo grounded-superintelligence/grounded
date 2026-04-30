@@ -4,11 +4,10 @@ from typing import Tuple
 import cv2
 import numpy as np
 import rerun as rr
-from scipy.spatial.transform import Rotation as R
 from tqdm import tqdm
 
 from grounded.data.ego_dataset import EgoEpisode
-from grounded.data.visualize import HAND_EDGES, LEFT_HAND_COLOR, RIGHT_HAND_COLOR, transform_points
+from grounded.data.visualize import HAND_EDGES, LEFT_HAND_COLOR, RIGHT_HAND_COLOR
 
 
 def extract_intrinsics(P: np.ndarray) -> Tuple[float, float, float, float]:
@@ -16,14 +15,6 @@ def extract_intrinsics(P: np.ndarray) -> Tuple[float, float, float, float]:
     fx, fy = P[0, 0], P[1, 1]
     cx, cy = P[0, 2], P[1, 2]
     return fx, fy, cx, cy
-
-
-def c2w_to_matrix(c2w: np.ndarray) -> np.ndarray:
-    """Converts a [tx, ty, tz, qx, qy, qz, qw] pose into a 4x4 transformation matrix."""
-    T = np.eye(4)
-    T[:3, :3] = R.from_quat(c2w[3:]).as_matrix()
-    T[:3, 3] = c2w[:3]
-    return T
 
 
 def unproject_depth(
@@ -36,6 +27,7 @@ def unproject_depth(
     u_grid: np.ndarray,
     v_grid: np.ndarray,
     step: int = 1,
+    max_depth: int = 2.5,  # meters
 ) -> Tuple[np.ndarray, np.ndarray]:
     """Unprojects a depth map into 3D points in the local camera coordinate frame."""
     # subsample uniformly across height and width BEFORE flattening
@@ -45,7 +37,7 @@ def unproject_depth(
     v_sub = v_grid[::step, ::step]
 
     # filter valid depths
-    valid = depth_sub > 0
+    valid = (depth_sub > 0) & (depth_sub < max_depth) & np.isfinite(depth_sub)
     z = depth_sub[valid]
     u = u_sub[valid]
     v = v_sub[valid]
@@ -60,9 +52,9 @@ def unproject_depth(
     return points_local, colors
 
 
-def log_hand_to_rerun(entity_path: str, keypoints_world: np.ndarray, color_bgr: tuple):
+def log_hand_to_rerun(entity_path: str, keypoints: np.ndarray, color_bgr: tuple):
     """Plots hand joints and bone segments, or clears them if keypoints are missing."""
-    if keypoints_world is None or len(keypoints_world) == 0:
+    if keypoints is None or len(keypoints) == 0:
         rr.log(entity_path, rr.Clear(recursive=True))
         return
 
@@ -70,13 +62,13 @@ def log_hand_to_rerun(entity_path: str, keypoints_world: np.ndarray, color_bgr: 
     color_rgb = (color_bgr[2], color_bgr[1], color_bgr[0])
 
     # joints
-    rr.log(f"{entity_path}/joints", rr.Points3D(keypoints_world, colors=[color_rgb] * len(keypoints_world), radii=0.01))
+    rr.log(f"{entity_path}/joints", rr.Points3D(keypoints, colors=[color_rgb] * len(keypoints), radii=0.005))
 
     # bones (line strips)
     strips = []
     for i, j in HAND_EDGES:
-        if i < len(keypoints_world) and j < len(keypoints_world):
-            strips.append([keypoints_world[i], keypoints_world[j]])
+        if i < len(keypoints) and j < len(keypoints):
+            strips.append([keypoints[i], keypoints[j]])
 
     if strips:
         rr.log(f"{entity_path}/bones", rr.LineStrips3D(strips, colors=[color_rgb] * len(strips)))
@@ -90,7 +82,7 @@ def visualize_episode_to_rerun(
 ):
     """
     Unprojects left-front depth maps into point clouds, aligns hands,
-    transforms them into the world frame, and logs them to a Rerun file.
+    and logs them to a Rerun file in the local camera frame.
     """
     assert "left-front" in episode.active_cameras, "Rerun visualizer needs left-front in active_cameras"
 
@@ -107,9 +99,7 @@ def visualize_episode_to_rerun(
     v_grid, u_grid = np.indices((H, W))
 
     # coordinate system is right/down/forward
-    rr.log("world", rr.ViewCoordinates.RDF, static=True)
-
-    T_0_inv = None
+    rr.log("camera", rr.ViewCoordinates.RDF, static=True)
 
     for i in tqdm(range(len(episode)), desc="visualizing 3d", leave=False):
         if i % fps_downsample > 0:
@@ -120,18 +110,7 @@ def visualize_episode_to_rerun(
         rr.set_time("frame_idx", sequence=i)
         rr.set_time("timestamp", timestamp=np.datetime64(frame.timestamp_ns, "ns"))
 
-        # relative camera pose
-        T_i = c2w_to_matrix(frame.c2w)
-        if T_0_inv is None:
-            T_0_inv = np.linalg.inv(T_i)
-        T_rel = T_0_inv @ T_i
-
-        rr.log(
-            "world/left_front_camera",
-            rr.Transform3D(translation=T_rel[:3, 3], rotation=rr.Quaternion(xyzw=R.from_matrix(T_rel[:3, :3]).as_quat())),
-        )
-
-        # unproject depth into world point clouds
+        # unproject depth into local point clouds
         depth = cv2.resize(frame.left_front_depth, (W, H), interpolation=cv2.INTER_NEAREST)
         points_local, colors = unproject_depth(
             depth,
@@ -144,16 +123,13 @@ def visualize_episode_to_rerun(
             v_grid,
             pcd_downsample,
         )
-        points_world = transform_points(points_local, T_rel)
 
-        rr.log("world/point_cloud", rr.Points3D(points_world, colors=colors))
+        rr.log("camera/point_cloud", rr.Points3D(points_local, colors=colors))
 
-        # left hand
-        lh_world = transform_points(frame.left_hand_kp, T_rel) if frame.left_hand_kp is not None else None
-        log_hand_to_rerun("world/left_hand", lh_world, LEFT_HAND_COLOR)
+        # left hand (logged directly in local frame)
+        log_hand_to_rerun("camera/left_hand", frame.left_hand_kp, LEFT_HAND_COLOR)
 
-        # right hand
-        rh_world = transform_points(frame.right_hand_kp, T_rel) if frame.right_hand_kp is not None else None
-        log_hand_to_rerun("world/right_hand", rh_world, RIGHT_HAND_COLOR)
+        # right hand (logged directly in local frame)
+        log_hand_to_rerun("camera/right_hand", frame.right_hand_kp, RIGHT_HAND_COLOR)
 
     print(f"Saved Rerun visualizer file to: {output_path}")

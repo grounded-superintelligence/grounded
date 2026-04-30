@@ -5,6 +5,7 @@ Visualization script for viewing EgoDataset episodes
 from concurrent.futures import ThreadPoolExecutor
 
 import cv2
+import imageio.v2 as imageio
 import numpy as np
 from tqdm import tqdm
 
@@ -68,7 +69,8 @@ def draw_uv_skeleton(image: np.ndarray, uvs: np.ndarray, is_right: bool):
     if len(uvs) == 0:
         return image
     img = image.copy()
-    h, w = img.shape[:2]
+
+    CLAMP = 1 << 15
 
     for i, j in HAND_EDGES:
         if i >= len(uvs) or j >= len(uvs):
@@ -77,9 +79,9 @@ def draw_uv_skeleton(image: np.ndarray, uvs: np.ndarray, is_right: bool):
         u2, v2 = uvs[j]
         if not np.all(np.isfinite([u1, v1, u2, v2])):
             continue
+        u1, v1, u2, v2 = np.clip([u1, v1, u2, v2], -CLAMP, CLAMP)
         p1, p2 = (int(round(u1)), int(round(v1))), (int(round(u2)), int(round(v2)))
-        if 0 <= p1[0] < w and 0 <= p1[1] < h and 0 <= p2[0] < w and 0 <= p2[1] < h:
-            cv2.line(img, p1, p2, JOINTS_COLOR, 3, cv2.LINE_AA)
+        cv2.line(img, p1, p2, JOINTS_COLOR, 3, cv2.LINE_AA)
     return img
 
 
@@ -285,23 +287,6 @@ def visualize_episode_to_mp4(
             new_h = int(h * (new_w / w))
             stacked = cv2.resize(stacked, (new_w, new_h))
 
-        # draw caption
-        if hasattr(episode, "caption") and episode.caption:
-            caption_text = f"Caption: {episode.caption}"
-
-            font = cv2.FONT_HERSHEY_SIMPLEX
-            font_scale = 0.8
-            thickness = 2
-            (text_width, text_height), baseline = cv2.getTextSize(caption_text, font, font_scale, thickness)
-            margin = 15
-            x = margin
-            y = stacked.shape[0] - margin - baseline
-
-            overlay = stacked.copy()
-            cv2.rectangle(overlay, (x - 5, y - text_height - 5), (x + text_width + 5, y + baseline + 5), (0, 0, 0), -1)
-            cv2.addWeighted(overlay, 0.6, stacked, 0.4, 0, stacked)
-            cv2.putText(stacked, caption_text, (x, y), font, font_scale, (255, 255, 255), thickness, cv2.LINE_AA)
-
         return stacked
 
     # threaded video rendering
@@ -309,12 +294,11 @@ def visualize_episode_to_mp4(
         rendered_frames = executor.map(_process_frame, range(len(episode)))
         for stacked in tqdm(rendered_frames, total=len(episode), desc="visualizing 2d", leave=False):
             if writer is None:
-                target_h, target_w = stacked.shape[:2]
-                writer = cv2.VideoWriter(output_path, cv2.VideoWriter_fourcc(*"mp4v"), fps, (target_w, target_h))
-            writer.write(stacked)
+                writer = imageio.get_writer(output_path, codec="libx264", fps=fps)
+            writer.append_data(cv2.cvtColor(stacked, cv2.COLOR_BGR2RGB))
 
     if writer is not None:
-        writer.release()
+        writer.close()
         print(f"Saved to {output_path}")
     else:
         print("Error: No frames were written to the video.")

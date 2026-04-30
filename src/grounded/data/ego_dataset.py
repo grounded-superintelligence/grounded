@@ -5,7 +5,6 @@ A simple dataset abstraction over GSI data
 import json
 import os
 import posixpath
-import shutil
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
@@ -41,7 +40,7 @@ class FrameData:
     c2w: Optional[np.ndarray]  # [tx, ty, tz, qx, qy, qz, qw]
 
 
-class PathManager:
+class LocalPathManager:
     """Utility for resolving synchronized sub-paths for an episode."""
 
     def __init__(self, rectified_dir: str):
@@ -53,6 +52,26 @@ class PathManager:
         self.front_pcd_dir = posixpath.join(hand_dir, "compressed_pcds", "left-front")
         self.eye_pcd_dir = posixpath.join(hand_dir, "compressed_pcds", "left-eye")
         self.slam_trajectory_txt = posixpath.join(processed_dir, "slam", "mav0", "pycuvslam_trajectory.txt")
+        self.stereo_params_npz = posixpath.join(rectified_dir, "stereo_params.npz")
+        self.timestamp_txt = posixpath.join(rectified_dir, "timestamp.txt")
+
+
+class S3PathManager:
+    """Utility for resolving synchronized sub-paths for an episode."""
+
+    def __init__(self, rectified_dir: str):
+        self.rectified_dir = rectified_dir
+        hand_dir = posixpath.dirname(rectified_dir)
+        processed_dir = posixpath.dirname(hand_dir)
+
+        self.hand_pose_dir = posixpath.join(hand_dir, "hand_tracking", "poses", "refined", "params")
+        self.front_pcd_dir = posixpath.join(hand_dir, "compressed_pcds", "left-front")
+        self.eye_pcd_dir = posixpath.join(hand_dir, "compressed_pcds", "left-eye")
+        # NOTE: there was a format change so we need to support both - this is the fallback version
+        self.slam_trajectory_txt = [
+            posixpath.join(processed_dir, "slam", "mav0", "pycuvslam_trajectory.txt"),
+            posixpath.join(processed_dir, "slam", "pycuvslam_trajectory.txt"),
+        ]
         self.stereo_params_npz = posixpath.join(rectified_dir, "stereo_params.npz")
         self.timestamp_txt = posixpath.join(rectified_dir, "timestamp.txt")
 
@@ -84,21 +103,25 @@ class CacheManager:
         episode_id = f"{device_id}-{session_num}-{segment_num}-{frame_start}-{frame_end}"
 
         local_rectified_data_dir = self._get_local_path(episode_info, episode_uri)
-        local_paths = PathManager(local_rectified_data_dir)
+        local_paths = LocalPathManager(local_rectified_data_dir)
 
-        # a unique lock file for this specific episode
-        lock_path = self.locks_dir / f"{episode_id}.lock"
+        if episode_uri.startswith("s3://"):
+            # a unique lock file for this specific episode
+            lock_path = self.locks_dir / f"{episode_id}.lock"
 
-        with filelock.FileLock(str(lock_path)):
-            # if valid cache exists, return immediately (like hf datasets)
-            if self._validate_episode_dir(local_paths, frame_start, frame_end):
-                return local_rectified_data_dir
+            with filelock.FileLock(str(lock_path)):
+                # if valid cache exists, return immediately (like hf datasets)
+                if self._validate_episode_dir(local_paths, frame_start, frame_end):
+                    return local_rectified_data_dir
 
-            self._download_and_sync(episode_info, episode_uri, local_paths, s3_concurrency, episode_id)
-            self._merge_hand_streams(local_paths, frame_start, frame_end)
+                # this is a no-op if the dataset exists locally at the specified path
+                self._download_and_sync(episode_info, episode_uri, local_paths, s3_concurrency, episode_id)
+                self._merge_hand_streams(local_paths, frame_start, frame_end)
 
-            if not self._validate_episode_dir(local_paths, frame_start, frame_end):
-                raise ValueError(f"Downloaded episode {local_rectified_data_dir} is missing required files post-processing.")
+                if not self._validate_episode_dir(local_paths, frame_start, frame_end):
+                    raise ValueError(
+                        f"Downloaded episode {local_rectified_data_dir} is missing required files post-processing."
+                    )
 
         return local_rectified_data_dir
 
@@ -120,7 +143,7 @@ class CacheManager:
         self,
         episode_info: dict,
         episode_uri: str,
-        local_paths: PathManager,
+        local_paths: LocalPathManager,
         s3_concurrency: int,
         episode_id: str,
     ):
@@ -133,32 +156,31 @@ class CacheManager:
         for cam in self.active_cameras:
             os.makedirs(os.path.join(local_paths.rectified_dir, cam), exist_ok=True)
 
-        if episode_uri.startswith("s3://"):
-            parsed = urlparse(episode_uri)
-            bucket_name = parsed.netloc
-            s3_base_prefix = posixpath.dirname(parsed.path.lstrip("/"))
+        parsed = urlparse(episode_uri)
+        bucket_name = parsed.netloc
+        s3_base_prefix = posixpath.dirname(parsed.path.lstrip("/"))
 
-            # boto3 config
-            config = botocore.config.Config(max_pool_connections=s3_concurrency)
-            session = boto3.Session(profile_name=self.aws_profile)
-            s3_client = session.client("s3", config=config)
+        # boto3 config
+        config = botocore.config.Config(max_pool_connections=s3_concurrency)
+        session = boto3.Session(profile_name=self.aws_profile)
+        s3_client = session.client("s3", config=config)
 
-            def _sync_file(src: str, dst: str):
-                if not os.path.exists(dst):
-                    os.makedirs(os.path.dirname(dst), exist_ok=True)
-                    p = urlparse(src)
+        def _sync_file(src: Union[str, List[str]], dst: str):
+            # Download single src, or src with fallbacks
+            if os.path.exists(dst):
+                return
+
+            sources = src if isinstance(src, list) else [src]
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            for s in sources:
+                p = urlparse(s)
+                try:
                     s3_client.download_file(p.netloc, p.path.lstrip("/"), dst)
+                    return
+                except botocore.exceptions.ClientError:
+                    continue
 
-            src_paths = PathManager(f"s3://{bucket_name}/{s3_base_prefix}")
-        else:
-            # local sync
-            src_rectified_data_dir = os.path.abspath(os.path.dirname(episode_uri))
-            src_paths = PathManager(src_rectified_data_dir)
-
-            def _sync_file(src: str, dst: str):
-                if not os.path.exists(dst) and os.path.exists(src):
-                    os.makedirs(os.path.dirname(dst), exist_ok=True)
-                    shutil.copy2(src, dst)
+        src_paths = S3PathManager(f"s3://{bucket_name}/{s3_base_prefix}")
 
         all_download_tasks = [
             (src_paths.timestamp_txt, local_paths.timestamp_txt),
@@ -200,7 +222,7 @@ class CacheManager:
 
         print(f"Finished downloading {episode_id}.")
 
-    def _merge_hand_streams(self, path_manager: PathManager, frame_start: int, frame_end: int):
+    def _merge_hand_streams(self, path_manager: LocalPathManager, frame_start: int, frame_end: int):
         """
         Phase 1: Project missing front detections from the eye cameras and save to disk.
         Phase 2: Group remaining complete gaps and fill them using Linear Interpolation (LERP).
@@ -367,10 +389,11 @@ class CacheManager:
         _process_hand_gaps(_group_gaps(missing_left), is_left=True)
         _process_hand_gaps(_group_gaps(missing_right), is_left=False)
 
-    def _validate_episode_dir(self, path_manager: PathManager, frame_start: int, frame_end: int) -> bool:
+    def _validate_episode_dir(self, path_manager: LocalPathManager, frame_start: int, frame_end: int) -> bool:
         required = [
             path_manager.timestamp_txt,
             path_manager.stereo_params_npz,
+            path_manager.slam_trajectory_txt,
             path_manager.hand_pose_dir,
             path_manager.front_pcd_dir,
             path_manager.eye_pcd_dir,
@@ -414,7 +437,7 @@ class EgoEpisode(Dataset):
         caption: Optional[str] = None,
     ):
         self.rectified_data_dir = rectified_data_dir
-        self.path_manager = PathManager(rectified_data_dir)
+        self.path_manager = LocalPathManager(rectified_data_dir)
         self.start_frame = start_frame
         self.end_frame = end_frame
         self.active_cameras = active_cameras
@@ -587,7 +610,11 @@ class EgoDataset(Dataset):
             return
 
         ep = self.index[idx]
-        key = f"{ep['device_id']}_interval_{ep['frame_start']}_{ep['frame_end']}"
+        key = (
+            f"{ep['device_id']}_session_{ep['session_num']}"
+            f"_segment_{ep['segment_num']}_interval_"
+            f"{ep['frame_start']}_{ep['frame_end']}"
+        )
         return self.captions_map.get(key)
 
     def __len__(self):
