@@ -1,7 +1,23 @@
 """
-A simple dataset abstraction over GSI data
+A simple dataset abstraction over GSI data.
+
+Storage on S3 is per-segment H.264 MP4s with closed GOPs and sidecar
+indexes ({cam}.mp4 + {cam}.idx.json under rectified_dataset/). To serve an
+episode, the SDK fetches only the byte range of the segment's MP4
+containing the requested frames, decodes them, and materializes the
+frames in the local cache as frame_XXXXXX.jpg. Downstream code
+(EgoEpisode) reads the cache as before.
+
+Segments without both .mp4 and .idx.json are not supported - this SDK
+expects the conversion pipeline to have run. Filter index.json with
+filter_index.py to drop episodes whose segments aren't converted.
+
+Dependency:
+    av  (PyAV; pip install av)
 """
 
+import bisect
+import io
 import json
 import os
 import posixpath
@@ -22,6 +38,8 @@ from tqdm.auto import tqdm
 
 GROUNDED_DIR_DEFAULT = os.path.expanduser("~/.cache/grounded/data/")
 LOCKS_DIR_DEFAULT = os.path.expanduser("~/.cache/grounded/locks/")
+
+JPG_QUALITY_ON_WRITE = 95
 
 
 @dataclass
@@ -76,11 +94,268 @@ class S3PathManager:
         self.timestamp_txt = posixpath.join(rectified_dir, "timestamp.txt")
 
 
+# =============================================================================
+# MP4 segment reader
+# =============================================================================
+
+
+class _PrefetchedS3Reader(io.RawIOBase):
+    """
+    Seekable file-like wrapper over an S3 object. Reads that fall inside a
+    pre-fetched range are served from memory; anything else issues an
+    on-demand range GET. PyAV / libavformat use this as the AVIOContext.
+
+    With the moov prefix AND the keyframe-anchored data range both prefetched,
+    every read libav issues for normal MP4 parsing + decoding is served from
+    cache - so the entire decode is two HTTP GETs.
+    """
+
+    def __init__(self, s3, bucket, key, size, prefetched):
+        self.s3 = s3
+        self.bucket = bucket
+        self.key = key
+        self.size = size
+        self.pos = 0
+        # list of (start, end, bytes) sorted by start
+        self._chunks = sorted((s, s + len(d), d) for s, d in prefetched)
+
+    def _serve(self, start, end):
+        for cs, ce, data in self._chunks:
+            if cs <= start and end <= ce:
+                return data[start - cs : end - cs]
+        return None
+
+    def readable(self):
+        return True
+
+    def writable(self):
+        return False
+
+    def seekable(self):
+        return True
+
+    def read(self, n=-1):
+        if n is None or n < 0:
+            n = self.size - self.pos
+        n = min(n, self.size - self.pos)
+        if n <= 0:
+            return b""
+        end = self.pos + n
+        cached = self._serve(self.pos, end)
+        if cached is not None:
+            self.pos = end
+            return cached
+        # Cache miss - serve from S3. Should be rare with proper prefetch.
+        resp = self.s3.get_object(
+            Bucket=self.bucket,
+            Key=self.key,
+            Range=f"bytes={self.pos}-{end - 1}",
+        )
+        data = resp["Body"].read()
+        self.pos += len(data)
+        return data
+
+    def readall(self):
+        return self.read(-1)
+
+    def readinto(self, b):
+        data = self.read(len(b))
+        n = len(data)
+        b[:n] = data
+        return n
+
+    def seek(self, offset, whence=0):
+        if whence == 0:
+            self.pos = offset
+        elif whence == 1:
+            self.pos += offset
+        elif whence == 2:
+            self.pos = self.size + offset
+        self.pos = max(0, min(self.pos, self.size))
+        return self.pos
+
+    def tell(self):
+        return self.pos
+
+
+class _Mp4SegmentExtractor:
+    """
+    Pulls a per-segment MP4 + sidecar from S3 and writes the frames for a
+    requested global-frame range to disk as frame_XXXXXX.jpg.
+
+    Strategy:
+      1. GET the small sidecar JSON.
+      2. Map global frame indices -> local (file-order) packet indices.
+      3. Find the keyframe at-or-before the start, and the next keyframe
+         at-or-after the end (or EOF) - this is the byte range we need.
+      4. Two range GETs: [0, init_bytes) for ftyp+moov+mdat header, and
+         [data_start, data_end) for the keyframe-anchored data.
+      5. Hand the result to PyAV via a seekable in-memory file-like and
+         decode just the frames we want.
+    """
+
+    def __init__(self, s3_client, bucket: str, segment_prefix: str, camera: str):
+        self.s3 = s3_client
+        self.bucket = bucket
+        self.mp4_key = posixpath.join(segment_prefix, f"{camera}.mp4")
+        self.sidecar_key = posixpath.join(segment_prefix, f"{camera}.idx.json")
+        self.camera = camera
+        self._sidecar = None
+
+    def exists(self) -> bool:
+        try:
+            self.s3.head_object(Bucket=self.bucket, Key=self.mp4_key)
+            self.s3.head_object(Bucket=self.bucket, Key=self.sidecar_key)
+            return True
+        except botocore.exceptions.ClientError as e:
+            code = e.response["Error"]["Code"]
+            if code in ("404", "NoSuchKey", "NotFound"):
+                return False
+            raise
+
+    @property
+    def sidecar(self) -> dict:
+        if self._sidecar is None:
+            body = self.s3.get_object(Bucket=self.bucket, Key=self.sidecar_key)["Body"].read()
+            self._sidecar = json.loads(body)
+        return self._sidecar
+
+    def extract_range(self, frame_start: int, frame_end: int, out_dir: str):
+        """Decode global frames [frame_start, frame_end) and write JPGs into out_dir."""
+        import av  # local import: only needed when MP4-backed segments are read
+
+        os.makedirs(out_dir, exist_ok=True)
+        side = self.sidecar
+        first_gf = side["first_global_frame"]
+        contiguous = side.get("contiguous", True)
+        offsets = side["offsets"]
+        sizes = side["sizes"]
+        kfs = side["keyframe_indices"]
+        fps = side["fps"]
+        file_size = side["file_size"]
+        init_bytes = side["init_bytes"]
+
+        # Map global -> local (file/decode-order) packet indices.
+        # In a closed-GOP MP4, all packets of GOP K occupy file positions
+        # [K*GOP, (K+1)*GOP), independent of internal B-frame reordering, so
+        # this packet-index space is the right thing to byte-range against.
+        if contiguous:
+            local_start = frame_start - first_gf
+            local_end = frame_end - first_gf
+
+            def local_to_global(i):
+                return first_gf + i
+        else:
+            gfi = side["global_frame_indices"]
+            local_start = gfi.index(frame_start)
+            local_end = gfi.index(frame_end - 1) + 1
+
+            def local_to_global(i):
+                return gfi[i]
+
+        # Sanity-check the request against the actual MP4 length. The two
+        # common ways this trips:
+        #   - The index says frame_start=X (a JPG-derived global frame
+        #     number), but the sidecar was authored for a legacy MP4
+        #     segment where first_global_frame=0. local_start ends up far
+        #     past the MP4's actual length.
+        #   - The index references frames the segment never had (range
+        #     misaligned).
+        # Without this check, we'd silently read past the end of `offsets`
+        # and produce no output, which surfaces downstream as a less
+        # informative FileNotFoundError on the missing JPG cache files.
+        n_frames_in_mp4 = len(offsets)
+        if local_start < 0 or local_start >= n_frames_in_mp4:
+            sidecar_source = side.get("source", "unknown")
+            raise IndexError(
+                f"Requested global frames [{frame_start}, {frame_end}) "
+                f"don't map into this MP4. Sidecar first_global_frame="
+                f"{first_gf}, num_frames={n_frames_in_mp4}, source="
+                f"{sidecar_source}. Computed local_start={local_start} "
+                f"is out of bounds [0, {n_frames_in_mp4}). This usually "
+                f"means the index.json's frame numbering doesn't match "
+                f"the sidecar's - e.g. an episode whose frame_start is a "
+                f"JPG-derived global index but whose segment is a legacy "
+                f"MP4 with first_global_frame=0."
+            )
+
+        # Clamp to valid range.
+        local_start = max(0, local_start)
+        local_end = min(len(offsets), local_end)
+        if local_end <= local_start:
+            return
+
+        # Find byte range covering all packets needed to decode [local_start, local_end):
+        #   start = keyframe at-or-before local_start
+        #   end   = either the next keyframe after local_end-1, or EOF
+        kf_idx = max(0, bisect.bisect_right(kfs, local_start) - 1)
+        kf_start = kfs[kf_idx]
+        next_kf_idx = bisect.bisect_right(kfs, local_end - 1)
+        last_packet = (kfs[next_kf_idx] - 1) if next_kf_idx < len(kfs) else (len(offsets) - 1)
+
+        data_start = offsets[kf_start]
+        data_end = offsets[last_packet] + sizes[last_packet]
+
+        # Two range GETs - the bulk of the egress savings happens here.
+        init_data = self.s3.get_object(
+            Bucket=self.bucket,
+            Key=self.mp4_key,
+            Range=f"bytes=0-{init_bytes - 1}",
+        )["Body"].read()
+        data_chunk = self.s3.get_object(
+            Bucket=self.bucket,
+            Key=self.mp4_key,
+            Range=f"bytes={data_start}-{data_end - 1}",
+        )["Body"].read()
+
+        reader = _PrefetchedS3Reader(
+            self.s3,
+            self.bucket,
+            self.mp4_key,
+            file_size,
+            prefetched=[(0, init_data), (data_start, data_chunk)],
+        )
+
+        with av.open(reader, mode="r") as container:
+            stream = container.streams.video[0]
+            stream.thread_type = "AUTO"
+
+            # Seek to the keyframe (pts in stream.time_base units). backward=True
+            # ensures we land on a keyframe at-or-before the target.
+            time_base = float(stream.time_base)
+            target_pts = int(round(kf_start / fps / time_base))
+            container.seek(target_pts, stream=stream, any_frame=False, backward=True)
+
+            # decode() yields VideoFrames in display order. We filter to the
+            # requested range and write each to disk as JPG.
+            for frame in container.decode(stream):
+                if frame.pts is None:
+                    continue
+                local_idx = int(round(float(frame.pts) * time_base * fps))
+                if local_idx < local_start:
+                    continue
+                if local_idx >= local_end:
+                    break
+
+                global_idx = local_to_global(local_idx)
+                bgr = frame.to_ndarray(format="bgr24")
+                out_path = os.path.join(out_dir, f"frame_{global_idx:06d}.jpg")
+                cv2.imwrite(out_path, bgr, [cv2.IMWRITE_JPEG_QUALITY, JPG_QUALITY_ON_WRITE])
+
+
+# =============================================================================
+# Cache manager
+# =============================================================================
+
+
 class CacheManager:
     """Handles thread-safe downloading, caching, and merging of episode data."""
 
     def __init__(
-        self, target_dir: str = GROUNDED_DIR_DEFAULT, aws_profile: Optional[str] = None, active_cameras: List[str] = None
+        self,
+        target_dir: str = GROUNDED_DIR_DEFAULT,
+        aws_profile: Optional[str] = None,
+        active_cameras: List[str] = None,
     ):
         self.target_dir = Path(target_dir).expanduser()
         self.aws_profile = aws_profile
@@ -106,15 +381,12 @@ class CacheManager:
         local_paths = LocalPathManager(local_rectified_data_dir)
 
         if episode_uri.startswith("s3://"):
-            # a unique lock file for this specific episode
             lock_path = self.locks_dir / f"{episode_id}.lock"
 
             with filelock.FileLock(str(lock_path)):
-                # if valid cache exists, return immediately (like hf datasets)
                 if self._validate_episode_dir(local_paths, frame_start, frame_end):
                     return local_rectified_data_dir
 
-                # this is a no-op if the dataset exists locally at the specified path
                 self._download_and_sync(episode_info, episode_uri, local_paths, s3_concurrency, episode_id)
                 self._merge_hand_streams(local_paths, frame_start, frame_end)
 
@@ -139,6 +411,8 @@ class CacheManager:
             )
             return os.path.join(self.target_dir, "local_sync", rel_path)
 
+    # ---- the main change: split camera downloads (MP4) from everything else --
+
     def _download_and_sync(
         self,
         episode_info: dict,
@@ -160,16 +434,13 @@ class CacheManager:
         bucket_name = parsed.netloc
         s3_base_prefix = posixpath.dirname(parsed.path.lstrip("/"))
 
-        # boto3 config
         config = botocore.config.Config(max_pool_connections=s3_concurrency)
         session = boto3.Session(profile_name=self.aws_profile)
         s3_client = session.client("s3", config=config)
 
         def _sync_file(src: Union[str, List[str]], dst: str):
-            # Download single src, or src with fallbacks
             if os.path.exists(dst):
                 return
-
             sources = src if isinstance(src, list) else [src]
             os.makedirs(os.path.dirname(dst), exist_ok=True)
             for s in sources:
@@ -182,45 +453,83 @@ class CacheManager:
 
         src_paths = S3PathManager(f"s3://{bucket_name}/{s3_base_prefix}")
 
-        all_download_tasks = [
+        # --- Non-camera files: timestamps, params, slam, hand poses, point clouds.
+        # All small per-frame npz files still come down individually for now.
+        non_camera_tasks = [
             (src_paths.timestamp_txt, local_paths.timestamp_txt),
             (src_paths.stereo_params_npz, local_paths.stereo_params_npz),
             (src_paths.slam_trajectory_txt, local_paths.slam_trajectory_txt),
         ]
         for frame_idx in range(frame_start, frame_end):
             npz_filename = f"frame_{frame_idx:06d}.npz"
-            jpg_filename = f"frame_{frame_idx:06d}.jpg"
-
-            all_download_tasks.append(
-                (posixpath.join(src_paths.hand_pose_dir, npz_filename), os.path.join(local_paths.hand_pose_dir, npz_filename))
-            )
-            all_download_tasks.append(
-                (posixpath.join(src_paths.front_pcd_dir, npz_filename), os.path.join(local_paths.front_pcd_dir, npz_filename))
-            )
-            all_download_tasks.append(
-                (posixpath.join(src_paths.eye_pcd_dir, npz_filename), os.path.join(local_paths.eye_pcd_dir, npz_filename))
-            )
-
-            for cam in self.active_cameras:
-                all_download_tasks.append(
-                    (
-                        posixpath.join(src_paths.rectified_dir, cam, jpg_filename),
-                        os.path.join(local_paths.rectified_dir, cam, jpg_filename),
-                    )
+            non_camera_tasks.append(
+                (
+                    posixpath.join(src_paths.hand_pose_dir, npz_filename),
+                    os.path.join(local_paths.hand_pose_dir, npz_filename),
                 )
+            )
+            non_camera_tasks.append(
+                (
+                    posixpath.join(src_paths.front_pcd_dir, npz_filename),
+                    os.path.join(local_paths.front_pcd_dir, npz_filename),
+                )
+            )
+            non_camera_tasks.append(
+                (
+                    posixpath.join(src_paths.eye_pcd_dir, npz_filename),
+                    os.path.join(local_paths.eye_pcd_dir, npz_filename),
+                )
+            )
 
-        # pull from s3 with concurrency
         with ThreadPoolExecutor(max_workers=s3_concurrency) as executor:
-            futures = [executor.submit(_sync_file, src, dst) for src, dst in all_download_tasks]
+            futures = [executor.submit(_sync_file, src, dst) for src, dst in non_camera_tasks]
             for future in tqdm(
-                as_completed(futures), total=len(futures), desc=f"Downloading {episode_id} (Files)", leave=False
+                as_completed(futures),
+                total=len(futures),
+                desc=f"Downloading {episode_id} (metadata)",
+                leave=False,
             ):
                 try:
                     future.result()
                 except Exception as e:
                     print(f"Failed to sync a file: {e}")
 
+        # Camera frames: every segment must have a converted MP4 + sidecar.
+        # If anything's missing or extraction fails, this is a hard error -
+        # there's no per-JPG fallback after the conversion was finalized.
+        for cam in self.active_cameras:
+            cam_dir = os.path.join(local_paths.rectified_dir, cam)
+            if self._cam_dir_already_populated(cam_dir, frame_start, frame_end):
+                continue
+
+            extractor = _Mp4SegmentExtractor(s3_client, bucket_name, s3_base_prefix, cam)
+            if not extractor.exists():
+                raise RuntimeError(
+                    f"No converted MP4+sidecar found for {cam} on "
+                    f"{episode_id}. Expected "
+                    f"s3://{bucket_name}/{s3_base_prefix}/{cam}.mp4 and "
+                    f"s3://{bucket_name}/{s3_base_prefix}/{cam}.idx.json. "
+                    f"If this segment was supposed to be converted, "
+                    f"investigate the conversion pipeline; if it's not in "
+                    f"the converted set, filter it out of index.json."
+                )
+            try:
+                extractor.extract_range(frame_start, frame_end, cam_dir)
+            except Exception as e:
+                raise RuntimeError(f"MP4 extraction failed for {cam} on {episode_id}: {e!r}")
+
         print(f"Finished downloading {episode_id}.")
+
+    @staticmethod
+    def _cam_dir_already_populated(cam_dir: str, frame_start: int, frame_end: int) -> bool:
+        if not os.path.isdir(cam_dir):
+            return False
+        for i in range(frame_start, frame_end):
+            if not os.path.exists(os.path.join(cam_dir, f"frame_{i:06d}.jpg")):
+                return False
+        return True
+
+    # ---- everything below is unchanged from the original SDK ------------------
 
     def _merge_hand_streams(self, path_manager: LocalPathManager, frame_start: int, frame_end: int):
         """
@@ -230,19 +539,15 @@ class CacheManager:
         stereo_npz = np.load(path_manager.stereo_params_npz, allow_pickle=True)
         T_f2e_unrect = stereo_npz["T_front_to_eye"]
 
-        # 1. unrectify eye
         R_eye_4x4 = np.eye(4)
         R_eye_4x4[:3, :3] = stereo_npz["eye_R1"]
         R_eye_inv = np.linalg.inv(R_eye_4x4)
 
-        # 2. eye-to-front projection
         T_e2f_unrect = np.linalg.inv(T_f2e_unrect)
 
-        # 3. rectify front
         R_front_4x4 = np.eye(4)
         R_front_4x4[:3, :3] = stereo_npz["front_R1"]
 
-        # combine: unrectify eye -> eye-to-front -> rectify front
         T_recteye_to_rectfront = R_front_4x4 @ T_e2f_unrect @ R_eye_inv
 
         def is_missing(kp):
@@ -279,21 +584,18 @@ class CacheManager:
 
             needs_save = False
 
-            # if left front is missing, check left eye
             if is_missing(l_front):
                 l_eye = (left_data.get("eye") or {}).get("keypoints_3d_rectcam")
                 l_front = project_eye_to_front(l_eye)
                 if not is_missing(l_front):
                     needs_save = True
 
-            # if right front is missing, check right eye
             if is_missing(r_front):
                 r_eye = (right_data.get("eye") or {}).get("keypoints_3d_rectcam")
                 r_front = project_eye_to_front(r_eye)
                 if not is_missing(r_front):
                     needs_save = True
 
-            # if we successfully recovered data from the eyes, SAVE it immediately
             if needs_save:
                 out_left = left_data.copy()
                 out_right = right_data.copy()
@@ -305,13 +607,11 @@ class CacheManager:
 
                 np.savez(filepath, left=np.array(out_left), right=np.array(out_right))
 
-            # Record if it is STILL missing after attempting the eye fallback
             if is_missing(l_front):
                 missing_left.append(i)
             if is_missing(r_front):
                 missing_right.append(i)
 
-        # check for lerp
         if not missing_left and not missing_right:
             return
 
@@ -342,7 +642,6 @@ class CacheManager:
 
         def _process_hand_gaps(gaps, is_left: bool):
             for gap in gaps:
-                # 1. seek backwards for nearest valid frame
                 start_valid = gap[0] - 1
                 start_kp = None
                 while start_valid >= 0:
@@ -352,7 +651,6 @@ class CacheManager:
                         break
                     start_valid -= 1
 
-                # 2. seek forwards for nearest valid frame
                 end_valid = gap[-1] + 1
                 end_kp = None
                 while end_valid < end_valid + 10000:
@@ -365,7 +663,6 @@ class CacheManager:
                 if start_kp is None or end_kp is None:
                     continue
 
-                # 3. lerp the gap
                 for i in gap:
                     w = (i - start_valid) / (end_valid - start_valid)
                     interp_kp = start_kp + w * (end_kp - start_kp)
@@ -378,7 +675,6 @@ class CacheManager:
                             out_left = d["left"].item()
                             out_right = d["right"].item()
 
-                    # Merge the interpolated data safely
                     if is_left:
                         out_left.setdefault("front", {})["keypoints_3d_rectcam"] = interp_kp
                     else:
@@ -449,20 +745,12 @@ class EgoEpisode(Dataset):
         with open(self.path_manager.timestamp_txt, "r") as f:
             self.timestamps = f.read().strip().split("\n")
 
-        # load raw c2w poses
         traj_data = np.loadtxt(self.path_manager.slam_trajectory_txt, comments="#")
         if traj_data.ndim == 1:
             traj_data = traj_data[None, :]
         self.c2w_timestamps = (traj_data[:, 0] * 1e9).astype(np.int64)
         unrect_c2w_poses = traj_data[:, 1:]
 
-        # NOTE: c2w poses are computed on the *unrectified* left-front camera
-        # all the per-frame data (depth, hand keypoints, point clouds) lives
-        # in the *rectified* left camera frame
-        #
-        # convert the pose so it can be applied directly to rect-frame points:
-        #     world_from_rect = world_from_unrect @ unrect_from_rect
-        # where unrect_from_rect is a pure rotation R1.T (R1 from cv2.stereoRectify).
         R1 = np.asarray(self.stereo_params["front_R1"])
         R_unrect_from_rect = R.from_matrix(R1.T)
         rot_unrect = R.from_quat(unrect_c2w_poses[:, 3:])
@@ -558,7 +846,11 @@ class EgoDataset(Dataset):
             f"active_cameras must be one of {self.CAMS}"
         )
 
-        self.cache_manager = CacheManager(target_dir=target_dir, aws_profile=aws_profile, active_cameras=self.active_cameras)
+        self.cache_manager = CacheManager(
+            target_dir=target_dir,
+            aws_profile=aws_profile,
+            active_cameras=self.active_cameras,
+        )
 
         if not self.index_path.exists():
             raise FileNotFoundError(f"Index file not found: {self.index_path}")
@@ -601,11 +893,6 @@ class EgoDataset(Dataset):
                     print(f"Download exception: {exc}")
 
     def get_caption(self, idx: int) -> Optional[str]:
-        """
-        Returns the caption for episode `idx`, or None if no caption is available.
-
-        See `docs/DATA.md` for more details on key naming convention
-        """
         if not self.captions_map:
             return
 
@@ -621,7 +908,6 @@ class EgoDataset(Dataset):
         return len(self.index)
 
     def __getitem__(self, idx) -> Union[EgoEpisode, List[EgoEpisode]]:
-        # Support dataset slicing
         if isinstance(idx, slice):
             return [self.__getitem__(i) for i in range(*idx.indices(len(self)))]
         if isinstance(idx, (list, tuple, np.ndarray)):
