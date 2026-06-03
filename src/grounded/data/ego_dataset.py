@@ -653,7 +653,7 @@ class CacheManager:
 
                 end_valid = gap[-1] + 1
                 end_kp = None
-                while end_valid < end_valid + 10000:
+                while end_valid < frame_end + 10000:
                     l, r = _load_front_only(end_valid)
                     end_kp = l if is_left else r
                     if end_kp is not None:
