@@ -456,6 +456,7 @@ class CacheManager:
         target_dir: str = GROUNDED_DIR_DEFAULT,
         aws_profile: Optional[str] = None,
         active_cameras: List[str] = None,
+        verbose: bool = False,
     ):
         self.target_dir = Path(target_dir).expanduser()
         self.aws_profile = aws_profile
@@ -465,7 +466,7 @@ class CacheManager:
         os.makedirs(self.target_dir, exist_ok=True)
         os.makedirs(self.locks_dir, exist_ok=True)
 
-    def download_episode(self, episode_info: dict, episode_uri: str, s3_concurrency: int = 100) -> str:
+    def download_episode(self, episode_info: dict, episode_uri: str, s3_concurrency: int = 256) -> str:
         """
         Thread-safe entry point. Locks the episode ID so multiple PyTorch workers
         don't collide while downloading or interpolating the same episode.
@@ -588,6 +589,7 @@ class CacheManager:
                 total=len(futures),
                 desc=f"Downloading {episode_id} (metadata)",
                 leave=False,
+                disable=not self.verbose,
             ):
                 try:
                     future.result()
