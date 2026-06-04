@@ -21,6 +21,7 @@ import io
 import json
 import os
 import posixpath
+import shutil
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
@@ -32,7 +33,7 @@ import botocore
 import cv2
 import filelock
 import numpy as np
-from scipy.spatial.transform import Rotation as R
+from scipy.spatial.transform import Rotation as R, Slerp
 from torch.utils.data import Dataset
 from tqdm.auto import tqdm
 
@@ -40,6 +41,103 @@ GROUNDED_DIR_DEFAULT = os.path.expanduser("~/.cache/grounded/data/")
 LOCKS_DIR_DEFAULT = os.path.expanduser("~/.cache/grounded/locks/")
 
 JPG_QUALITY_ON_WRITE = 95
+
+WRIST_POSE_SCHEMA = {
+    # rotation: 3x3 matrix (primary), or axis-angle (3,), or quat (4,, x,y,z,w)
+    "rot_keys": ["R_world_hand", "global_orient", "root_orient", "wrist_rot", "rot"],
+    # translation: (3,)
+    "transl_keys": ["t_world_hand", "transl", "translation", "wrist_xyz", "trans"],
+    # alternative: a single 4x4 (or 3x4) homogeneous transform
+    "matrix_keys": ["T_world_hand", "wrist_pose", "root_pose", "T_wrist", "pose_4x4"],
+}
+
+
+def _rotation_from_any(rot: np.ndarray) -> Optional[np.ndarray]:
+    """Coerce an axis-angle (3,), quaternion (4,, x,y,z,w), or 3x3 matrix into a 3x3 rotation."""
+    if rot is None:
+        return None
+    rot = np.asarray(rot, dtype=np.float64).squeeze()
+    if rot.shape == (3, 3):
+        return rot
+    if rot.shape == (3,):
+        return R.from_rotvec(rot).as_matrix()
+    if rot.shape == (4,):
+        # scipy expects (x, y, z, w)
+        return R.from_quat(rot).as_matrix()
+    if rot.shape == (4, 4):
+        return rot[:3, :3]
+
+
+def _parse_wrist_pose_from_hand(hand_dict: Optional[dict]) -> Optional[np.ndarray]:
+    """Extract a 4x4 wrist pose (rect left-front frame) from a full hand dict.
+
+    The hand dict is what `npz["left"|"right"].item()` returns: it holds the
+    top-level root pose (R_world_hand / t_world_hand) plus `front`/`eye` views.
+    Returns None if no recognizable, finite, non-degenerate pose is present
+    (which is treated as a gap by the interpolation pass).
+    """
+    if not isinstance(hand_dict, dict):
+        return None
+
+    # 1. single homogeneous-matrix key (alternative layout)
+    for k in WRIST_POSE_SCHEMA["matrix_keys"]:
+        m = hand_dict.get(k)
+        if m is not None:
+            m = np.asarray(m, dtype=np.float64).squeeze()
+            if m.shape == (4, 4):
+                T = m.copy()
+            elif m.shape == (3, 4):
+                T = np.eye(4)
+                T[:3, :4] = m
+            else:
+                continue
+            if np.all(T[:3, :3] == 0) or not np.isfinite(T).all():
+                return None
+            return T
+
+    # 2. rotation + translation keys (primary: R_world_hand / t_world_hand)
+    rot_val = next((hand_dict[k] for k in WRIST_POSE_SCHEMA["rot_keys"] if hand_dict.get(k) is not None), None)
+    tr_val = next((hand_dict[k] for k in WRIST_POSE_SCHEMA["transl_keys"] if hand_dict.get(k) is not None), None)
+    Rm = _rotation_from_any(rot_val)
+    # Reject a degenerate/zero rotation (e.g. an all-zero placeholder for an
+    # undetected hand) -- a valid rotation matrix has det ~ +1.
+    if not np.isfinite(Rm).all() or abs(np.linalg.det(Rm)) < 0.5:
+        return None
+    T = np.eye(4)
+    T[:3, :3] = Rm
+    if tr_val is not None:
+        t = np.asarray(tr_val, dtype=np.float64).squeeze()
+        if t.shape == (3,):
+            T[:3, 3] = t
+    if not np.isfinite(T).all():
+        return None
+    return T
+
+
+def _pose_is_missing(T: Optional[np.ndarray]) -> bool:
+    return T is None or not np.isfinite(np.asarray(T)).all() or np.all(np.asarray(T)[:3, :3] == 0)
+
+
+def _mat4x4_to_pos_quat(T: Optional[np.ndarray]) -> Optional[np.ndarray]:
+    """Convert a 4x4 pose to 7D [tx, ty, tz, qx, qy, qz, qw] (same layout as c2w).
+
+    Returns None if the pose is missing/degenerate.
+    """
+    if _pose_is_missing(T):
+        return None
+    T = np.asarray(T, dtype=np.float64)
+    quat = R.from_matrix(T[:3, :3]).as_quat()  # (x, y, z, w), like c2w
+    return np.concatenate([T[:3, 3], quat]).astype(np.float64)
+
+
+def _interp_pose(T_start: np.ndarray, T_end: np.ndarray, w: float) -> np.ndarray:
+    """Interpolate two 4x4 poses: LERP translation, SLERP rotation. w in [0, 1]."""
+    T = np.eye(4)
+    T[:3, 3] = (1.0 - w) * T_start[:3, 3] + w * T_end[:3, 3]
+    key_rots = R.from_matrix(np.stack([T_start[:3, :3], T_end[:3, :3]]))
+    slerp = Slerp([0.0, 1.0], key_rots)
+    T[:3, :3] = slerp([w])[0].as_matrix()
+    return T
 
 
 @dataclass
@@ -56,6 +154,8 @@ class FrameData:
     left_front_depth: Optional[np.ndarray]
     left_eye_depth: Optional[np.ndarray]
     c2w: Optional[np.ndarray]  # [tx, ty, tz, qx, qy, qz, qw]
+    left_wrist: Optional[np.ndarray]  # 7D [tx,ty,tz,qx,qy,qz,qw] in rect left-front frame, or None
+    right_wrist: Optional[np.ndarray]  # 7D [tx,ty,tz,qx,qy,qz,qw] in rect left-front frame, or None
 
 
 class LocalPathManager:
@@ -685,6 +785,107 @@ class CacheManager:
         _process_hand_gaps(_group_gaps(missing_left), is_left=True)
         _process_hand_gaps(_group_gaps(missing_right), is_left=False)
 
+        # Independent of the keypoint stream above: build and gap-fill the wrist-pose
+        # stream (translation LERP + rotation Slerp), gated by MAX_POSE_GAP_FRAMES.
+        self._merge_wrist_poses(path_manager, frame_start, frame_end)
+
+    # Largest gap (in frames) we will Slerp-fill for wrist poses. Longer gaps are
+    # left missing rather than risk a large-rotation interpolation error.
+    MAX_POSE_GAP_FRAMES = 15
+
+    def _merge_wrist_poses(self, path_manager: "LocalPathManager", frame_start: int, frame_end: int):
+        """Fill missing wrist poses independently of the 21-keypoint interpolation.
+
+        For each hand, reads the stored fitted root pose per frame, finds runs of
+        missing frames, and fills runs no longer than MAX_POSE_GAP_FRAMES by
+        interpolating the bracketing valid poses (LERP translation, SLERP rotation).
+        Filled poses are written under the 'wrist_pose_rectcam' key, never touching
+        'keypoints_3d_rectcam'.
+        """
+
+        def _load_pose(frame_idx: int, hand: str) -> Optional[np.ndarray]:
+            fp = os.path.join(path_manager.hand_pose_dir, f"frame_{frame_idx:06d}.npz")
+            if not os.path.exists(fp):
+                return None
+            try:
+                with np.load(fp, allow_pickle=True) as d:
+                    hand_dict = d[hand].item()
+            except Exception:
+                return None
+            # Prefer an already-materialized wrist pose (cached in the front view by a
+            # previous pass), else parse the fitted root pose from the top-level dict.
+            cached = (hand_dict.get("front") or {}).get("wrist_pose_rectcam")
+            if cached is not None:
+                T = np.asarray(cached, dtype=np.float64)
+                return None if _pose_is_missing(T) else T
+            T = _parse_wrist_pose_from_hand(hand_dict)
+            return None if _pose_is_missing(T) else T
+
+        def _write_pose(frame_idx: int, hand: str, T: np.ndarray):
+            fp = os.path.join(path_manager.hand_pose_dir, f"frame_{frame_idx:06d}.npz")
+            out_left, out_right = {}, {}
+            if os.path.exists(fp):
+                with np.load(fp, allow_pickle=True) as d:
+                    out_left = d["left"].item()
+                    out_right = d["right"].item()
+            target = out_left if hand == "left" else out_right
+            target.setdefault("front", {})["wrist_pose_rectcam"] = T.astype(np.float32)
+            np.savez(fp, left=np.array(out_left), right=np.array(out_right))
+
+        def _group_gaps(indices):
+            if not indices:
+                return []
+            gaps, current = [], [indices[0]]
+            for k in range(1, len(indices)):
+                if indices[k] == indices[k - 1] + 1:
+                    current.append(indices[k])
+                else:
+                    gaps.append(current)
+                    current = [indices[k]]
+            gaps.append(current)
+            return gaps
+
+        for hand in ("left", "right"):
+            # First materialize any natively-available pose so reads are stable,
+            # and record which frames are missing a pose.
+            missing = []
+            for i in range(frame_start, frame_end):
+                T = _load_pose(i, hand)
+                if T is None:
+                    missing.append(i)
+                else:
+                    # persist parsed-from-params pose under the canonical key (idempotent)
+                    _write_pose(i, hand, T)
+
+            for gap in _group_gaps(missing):
+                if len(gap) > self.MAX_POSE_GAP_FRAMES:
+                    continue  # too long; leave missing
+
+                start_valid = gap[0] - 1
+                T_start = None
+                while start_valid >= frame_start:
+                    T_start = _load_pose(start_valid, hand)
+                    if T_start is not None:
+                        break
+                    start_valid -= 1
+
+                end_valid = gap[-1] + 1
+                T_end = None
+                while end_valid < frame_end:
+                    T_end = _load_pose(end_valid, hand)
+                    if T_end is not None:
+                        break
+                    end_valid += 1
+
+                # Need both brackets to interpolate (no extrapolation at episode edges).
+                if T_start is None or T_end is None:
+                    continue
+
+                span = end_valid - start_valid
+                for i in gap:
+                    w = (i - start_valid) / span
+                    _write_pose(i, hand, _interp_pose(T_start, T_end, w))
+
     def _validate_episode_dir(self, path_manager: LocalPathManager, frame_start: int, frame_end: int) -> bool:
         required = [
             path_manager.timestamp_txt,
@@ -714,6 +915,57 @@ class CacheManager:
                         return False
 
         return True
+
+    # ---- local-cache cleanup --------------------------------------------------
+
+    def delete_episode(self, episode_info: dict, episode_uri: str, purge_segment: bool = False) -> int:
+        """Delete an episode's cached files to free disk. The cache is
+        per-segment, so by default only this episode's frame_*.{jpg,npz} in
+        [frame_start, frame_end) are removed; purge_segment=True drops the
+        whole segment dir (also wiping sibling episodes). Returns file count
+        removed. Locks the episode so it won't race its own download."""
+        fs, fe = episode_info["frame_start"], episode_info["frame_end"]
+        rect_dir = self._get_local_path(episode_info, episode_uri)
+        if not os.path.exists(rect_dir):
+            return 0
+        lp = LocalPathManager(rect_dir)
+
+        def _delete() -> int:
+            if purge_segment:
+                dirs = [lp.rectified_dir, lp.hand_pose_dir, lp.front_pcd_dir, lp.eye_pcd_dir]
+                n = sum(len(files) for d in dirs if os.path.isdir(d) for _, _, files in os.walk(d))
+                for d in dirs:
+                    shutil.rmtree(d, ignore_errors=True)
+                return n
+            cam_dirs = (
+                [
+                    os.path.join(lp.rectified_dir, e)
+                    for e in os.listdir(lp.rectified_dir)
+                    if os.path.isdir(os.path.join(lp.rectified_dir, e))
+                ]
+                if os.path.isdir(lp.rectified_dir)
+                else []
+            )
+            removed = 0
+            for i in range(fs, fe):
+                npz, jpg = f"frame_{i:06d}.npz", f"frame_{i:06d}.jpg"
+                paths = [
+                    os.path.join(lp.hand_pose_dir, npz),
+                    os.path.join(lp.front_pcd_dir, npz),
+                    os.path.join(lp.eye_pcd_dir, npz),
+                    *(os.path.join(c, jpg) for c in cam_dirs),
+                ]
+                for fp in paths:
+                    if os.path.exists(fp):
+                        os.remove(fp)
+                        removed += 1
+            return removed
+
+        if episode_uri.startswith("s3://"):
+            eid = f"{episode_info['device_id']}-{episode_info['session_num']}-{episode_info['segment_num']}-{fs}-{fe}"
+            with filelock.FileLock(str(self.locks_dir / f"{eid}.lock")):
+                return _delete()
+        return _delete()
 
 
 class EgoEpisode(Dataset):
@@ -762,18 +1014,38 @@ class EgoEpisode(Dataset):
     def _load_hand_streams(self, global_frame: int):
         filepath = os.path.join(self.path_manager.hand_pose_dir, f"frame_{global_frame:06d}.npz")
         if not os.path.exists(filepath):
-            return None, None
+            return None, None, None, None
 
         with np.load(filepath, allow_pickle=True) as hand_pose_data:
             left_data = hand_pose_data["left"].item()
             right_data = hand_pose_data["right"].item()
-            l_front = left_data.get("front", {}).get("keypoints_3d_rectcam")
-            r_front = right_data.get("front", {}).get("keypoints_3d_rectcam")
+            l_view = left_data.get("front", {}) or {}
+            r_view = right_data.get("front", {}) or {}
+            l_front = l_view.get("keypoints_3d_rectcam")
+            r_front = r_view.get("keypoints_3d_rectcam")
+            # Wrist poses: prefer the materialized/interpolated key (cached in the
+            # front view by _merge_wrist_poses); else parse the fitted root pose
+            # (R_world_hand / t_world_hand) from the top-level hand dict.
+            l_cached = l_view.get("wrist_pose_rectcam")
+            r_cached = r_view.get("wrist_pose_rectcam")
+            l_wrist = (
+                np.asarray(l_cached, dtype=np.float64) if l_cached is not None else _parse_wrist_pose_from_hand(left_data)
+            )
+            r_wrist = (
+                np.asarray(r_cached, dtype=np.float64) if r_cached is not None else _parse_wrist_pose_from_hand(right_data)
+            )
 
         def is_missing(kp):
             return kp is None or np.size(kp) == 0 or np.all(kp == 0)
 
-        return (None if is_missing(l_front) else l_front, None if is_missing(r_front) else r_front)
+        # Wrist poses are stored/interpolated as 4x4 internally; expose them as 7D
+        # [tx,ty,tz,qx,qy,qz,qw] to match the c2w layout (returns None if missing).
+        return (
+            None if is_missing(l_front) else l_front,
+            None if is_missing(r_front) else r_front,
+            _mat4x4_to_pos_quat(l_wrist),
+            _mat4x4_to_pos_quat(r_wrist),
+        )
 
     def _load_depth_stream(self, global_frame: int, cam_name: str) -> Optional[np.ndarray]:
         pcd_dir = self.path_manager.front_pcd_dir if cam_name == "left-front" else self.path_manager.eye_pcd_dir
@@ -801,7 +1073,7 @@ class EgoEpisode(Dataset):
                 raise FileNotFoundError(f"Missing image frame: {img_path}")
             imgs[cam] = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
 
-        l_front, r_front = self._load_hand_streams(global_frame)
+        l_front, r_front, l_wrist, r_wrist = self._load_hand_streams(global_frame)
         left_front_depth = self._load_depth_stream(global_frame, "left-front")
         left_eye_depth = self._load_depth_stream(global_frame, "left-eye")
 
@@ -819,6 +1091,8 @@ class EgoEpisode(Dataset):
             left_front_depth=left_front_depth,
             left_eye_depth=left_eye_depth,
             c2w=c2w,
+            left_wrist=l_wrist,
+            right_wrist=r_wrist,
         )
 
 
@@ -906,6 +1180,12 @@ class EgoDataset(Dataset):
 
     def __len__(self):
         return len(self.index)
+
+    def delete_episode(self, idx: int, purge_segment: bool = False) -> int:
+        """Delete episode `idx`'s cached files (see CacheManager.delete_episode).
+        purge_segment=True frees more but wipes sibling episodes from the same
+        segment; safe only in one-pass jobs. Returns file count removed."""
+        return self.cache_manager.delete_episode(self.index[idx], self.unique_uris[idx], purge_segment=purge_segment)
 
     def __getitem__(self, idx) -> Union[EgoEpisode, List[EgoEpisode]]:
         if isinstance(idx, slice):
