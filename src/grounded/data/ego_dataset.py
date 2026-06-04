@@ -1,19 +1,5 @@
 """
 A simple dataset abstraction over GSI data.
-
-Storage on S3 is per-segment H.264 MP4s with closed GOPs and sidecar
-indexes ({cam}.mp4 + {cam}.idx.json under rectified_dataset/). To serve an
-episode, the SDK fetches only the byte range of the segment's MP4
-containing the requested frames, decodes them, and materializes the
-frames in the local cache as frame_XXXXXX.jpg. Downstream code
-(EgoEpisode) reads the cache as before.
-
-Segments without both .mp4 and .idx.json are not supported - this SDK
-expects the conversion pipeline to have run. Filter index.json with
-filter_index.py to drop episodes whose segments aren't converted.
-
-Dependency:
-    av  (PyAV; pip install av)
 """
 
 import bisect
@@ -42,75 +28,25 @@ LOCKS_DIR_DEFAULT = os.path.expanduser("~/.cache/grounded/locks/")
 
 JPG_QUALITY_ON_WRITE = 95
 
-WRIST_POSE_SCHEMA = {
-    # rotation: 3x3 matrix (primary), or axis-angle (3,), or quat (4,, x,y,z,w)
-    "rot_keys": ["R_world_hand", "global_orient", "root_orient", "wrist_rot", "rot"],
-    # translation: (3,)
-    "transl_keys": ["t_world_hand", "transl", "translation", "wrist_xyz", "trans"],
-    # alternative: a single 4x4 (or 3x4) homogeneous transform
-    "matrix_keys": ["T_world_hand", "wrist_pose", "root_pose", "T_wrist", "pose_4x4"],
-}
-
-
-def _rotation_from_any(rot: np.ndarray) -> Optional[np.ndarray]:
-    """Coerce an axis-angle (3,), quaternion (4,, x,y,z,w), or 3x3 matrix into a 3x3 rotation."""
-    if rot is None:
-        return None
-    rot = np.asarray(rot, dtype=np.float64).squeeze()
-    if rot.shape == (3, 3):
-        return rot
-    if rot.shape == (3,):
-        return R.from_rotvec(rot).as_matrix()
-    if rot.shape == (4,):
-        # scipy expects (x, y, z, w)
-        return R.from_quat(rot).as_matrix()
-    if rot.shape == (4, 4):
-        return rot[:3, :3]
-
 
 def _parse_wrist_pose_from_hand(hand_dict: Optional[dict]) -> Optional[np.ndarray]:
-    """Extract a 4x4 wrist pose (rect left-front frame) from a full hand dict.
+    """Build a 4x4 wrist pose (rect left-front frame) from a full hand dict.
 
-    The hand dict is what `npz["left"|"right"].item()` returns: it holds the
-    top-level root pose (R_world_hand / t_world_hand) plus `front`/`eye` views.
-    Returns None if no recognizable, finite, non-degenerate pose is present
-    (which is treated as a gap by the interpolation pass).
+    The hand dict is what `npz["left"|"right"].item()` returns; it holds the
+    fitted root pose as R_world_hand (3x3) + t_world_hand (3,) at the top level.
+    Returns None only if those keys are absent (an undetected hand), which the
+    interpolation pass treats as a gap. The rotation's shape/validity is a
+    dataset invariant (always a proper 3x3), so it is not re-checked here.
     """
     if not isinstance(hand_dict, dict):
         return None
-
-    # 1. single homogeneous-matrix key (alternative layout)
-    for k in WRIST_POSE_SCHEMA["matrix_keys"]:
-        m = hand_dict.get(k)
-        if m is not None:
-            m = np.asarray(m, dtype=np.float64).squeeze()
-            if m.shape == (4, 4):
-                T = m.copy()
-            elif m.shape == (3, 4):
-                T = np.eye(4)
-                T[:3, :4] = m
-            else:
-                continue
-            if np.all(T[:3, :3] == 0) or not np.isfinite(T).all():
-                return None
-            return T
-
-    # 2. rotation + translation keys (primary: R_world_hand / t_world_hand)
-    rot_val = next((hand_dict[k] for k in WRIST_POSE_SCHEMA["rot_keys"] if hand_dict.get(k) is not None), None)
-    tr_val = next((hand_dict[k] for k in WRIST_POSE_SCHEMA["transl_keys"] if hand_dict.get(k) is not None), None)
-    Rm = _rotation_from_any(rot_val)
-    # Reject a degenerate/zero rotation (e.g. an all-zero placeholder for an
-    # undetected hand) -- a valid rotation matrix has det ~ +1.
-    if not np.isfinite(Rm).all() or abs(np.linalg.det(Rm)) < 0.5:
+    Rm = hand_dict.get("R_world_hand")
+    t = hand_dict.get("t_world_hand")
+    if Rm is None or t is None:
         return None
     T = np.eye(4)
-    T[:3, :3] = Rm
-    if tr_val is not None:
-        t = np.asarray(tr_val, dtype=np.float64).squeeze()
-        if t.shape == (3,):
-            T[:3, 3] = t
-    if not np.isfinite(T).all():
-        return None
+    T[:3, :3] = np.asarray(Rm, dtype=np.float64)
+    T[:3, 3] = np.asarray(t, dtype=np.float64).reshape(3)
     return T
 
 
@@ -467,7 +403,7 @@ class CacheManager:
         os.makedirs(self.target_dir, exist_ok=True)
         os.makedirs(self.locks_dir, exist_ok=True)
 
-    def download_episode(self, episode_info: dict, episode_uri: str, s3_concurrency: int = 256) -> str:
+    def download_episode(self, episode_info: dict, episode_uri: str, s3_concurrency: int = 64) -> str:
         """
         Thread-safe entry point. Locks the episode ID so multiple PyTorch workers
         don't collide while downloading or interpolating the same episode.
