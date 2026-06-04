@@ -462,6 +462,7 @@ class CacheManager:
         self.aws_profile = aws_profile
         self.active_cameras = active_cameras or ["left-front", "right-front"]
         self.locks_dir = Path(LOCKS_DIR_DEFAULT).expanduser()
+        self.verbose = verbose
 
         os.makedirs(self.target_dir, exist_ok=True)
         os.makedirs(self.locks_dir, exist_ok=True)
@@ -620,7 +621,8 @@ class CacheManager:
             except Exception as e:
                 raise RuntimeError(f"MP4 extraction failed for {cam} on {episode_id}: {e!r}")
 
-        print(f"Finished downloading {episode_id}.")
+        if self.verbose:
+            print(f"Finished downloading {episode_id}.")
 
     @staticmethod
     def _cam_dir_already_populated(cam_dir: str, frame_start: int, frame_end: int) -> bool:
