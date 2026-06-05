@@ -4,20 +4,25 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "grounded"
-version = "0.2.0"
+version = "0.2.1"
 description = "GSI SDK"
 authors = [
   { name="Vincent Liu", email="vincent@gsi.company" }
 ]
 requires-python = ">=3.10"
 dependencies = [
-    "numpy>2",
-    "opencv-python",
-    "scipy",
+    "av",
     "boto3",
     "botocore[crt]",
     "boto3-stubs[s3]",
+    "filelock",
+    "imageio",
+    "imageio-ffmpeg",
+    "numpy>2",
+    "opencv-python",
     "rerun-sdk",
+    "scipy",
+    "torch",
     "tqdm",
 ]
 
