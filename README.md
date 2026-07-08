@@ -25,6 +25,11 @@ python -m pip install git+https://github.com/grounded-superintelligence/grounded
 ```
 
 ## usage
+
+### v1
+The latest version is still in development. You can checkout `v1.0.0` branch to use the implementation. See `demo_v1.py` for how to visualize a whole hand tracking session.
+
+### v0
 You should be given an `index.json`, `captions.jsonl`, and `credentials` that corresponds your proprietary dataset. Add the contents of `credentials` to your `~/.aws/credentials` file. Below is a basic snippet of the basic modules present in `grounded` SDK:
 
 ```python
