@@ -64,12 +64,16 @@ HAND_EDGES = [
 
 
 def draw_uv_skeleton(image: np.ndarray, uvs: np.ndarray, inplace: bool = False) -> np.ndarray:
-    """Draws the MANO-21 bone edges. Set inplace=True to skip the image copy."""
+    """Draws the MANO-21 bone edges.
+
+    An edge is drawn only when BOTH endpoints are finite and lie inside the
+    image; bones with an off-screen endpoint are skipped entirely rather than
+    clipped at the border. Set inplace=True to skip the image copy.
+    """
     if len(uvs) == 0:
         return image
     img = image if inplace else image.copy()
-
-    CLAMP = 1 << 15
+    h, w = img.shape[:2]
 
     for i, j in HAND_EDGES:
         if i >= len(uvs) or j >= len(uvs):
@@ -78,14 +82,19 @@ def draw_uv_skeleton(image: np.ndarray, uvs: np.ndarray, inplace: bool = False) 
         u2, v2 = uvs[j]
         if not np.all(np.isfinite([u1, v1, u2, v2])):
             continue
-        u1, v1, u2, v2 = np.clip([u1, v1, u2, v2], -CLAMP, CLAMP)
-        p1, p2 = (int(round(u1)), int(round(v1))), (int(round(u2)), int(round(v2)))
+        p1 = (int(round(u1)), int(round(v1)))
+        p2 = (int(round(u2)), int(round(v2)))
+        if not (0 <= p1[0] < w and 0 <= p1[1] < h and 0 <= p2[0] < w and 0 <= p2[1] < h):
+            continue
         cv2.line(img, p1, p2, JOINTS_COLOR, 3, cv2.LINE_AA)
     return img
 
 
 def draw_uv_points(image: np.ndarray, uvs: np.ndarray, color: tuple, inplace: bool = False) -> np.ndarray:
-    """Draws the joint dots. Set inplace=True to skip the image copy."""
+    """Draws the joint dots; points outside the image are skipped.
+
+    Set inplace=True to skip the image copy.
+    """
     if len(uvs) == 0:
         return image
     img = image if inplace else image.copy()
@@ -103,13 +112,19 @@ def _draw_hand(img_bgr: np.ndarray, episode: HandEpisode, hand: Optional[HandPos
     """Draws one hand in place on img_bgr (a per-frame scratch buffer)."""
     if hand is None:
         return img_bgr
-    # points behind the camera plane project to garbage; skip the hand entirely
     T = episode.camera_params[f"T_{camera}_from_left_front"]
     pts_h = np.concatenate([hand.keypoints3d, np.ones((len(hand.keypoints3d), 1))], axis=-1)
     z_cam = (T @ pts_h.T).T[:, 2]
-    if np.all(z_cam <= 1e-6):
+    behind = z_cam <= 1e-6
+    if np.all(behind):
         return img_bgr
+
     uvs = episode.project_to_camera(hand.keypoints3d, camera)
+    # a behind-camera point projects THROUGH the principal point and can land
+    # inside the image at a plausible-looking position; mask such points so
+    # they (and their bones) are skipped like any other invalid point
+    uvs = np.where(behind[:, None], np.nan, uvs)
+
     color = base_color if hand.is_detected else INVALID_HAND_COLOR
     img_bgr = draw_uv_points(img_bgr, uvs, color, inplace=True)
     return draw_uv_skeleton(img_bgr, uvs, inplace=True)
