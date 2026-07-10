@@ -9,6 +9,7 @@ import argparse
 import os
 
 from grounded.data.hand_dataset import HAND_CAMS, HandEpisode, download_hand_segment
+from grounded.data.visualize_hand import visualize_hand_episode_to_mp4
 from grounded.data.visualize_hand_3d import visualize_hand_episode_to_rerun
 
 
@@ -35,11 +36,11 @@ def main():
             f"{len(episode.continuous_intervals)} continuous both-hands intervals"
         )
 
-        # visualize_hand_episode_to_mp4(
-        #     episode,
-        #     os.path.join(args.out_dir, f"handvis_segment{args.segment}.mp4"),
-        #     downsample=args.downsample,
-        # )
+        visualize_hand_episode_to_mp4(
+            episode,
+            os.path.join(args.out_dir, f"handvis_segment{args.segment}.mp4"),
+            downsample=args.downsample,
+        )
         visualize_hand_episode_to_rerun(
             episode,
             os.path.join(args.out_dir, f"handvis_segment{args.segment}.rrd"),

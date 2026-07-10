@@ -343,7 +343,7 @@ class HandEpisode(Dataset):
         with open(self.path_manager.continuous_intervals_json, "r") as f:
             intervals_raw = json.load(f)
         # inclusive [start, end] runs where both hands are valid
-        self.continuous_intervals: List[dict] = intervals_raw.get("intervals", [])
+        self.continuous_intervals: List[dict] = intervals_raw.get("both_intervals", [])
 
         self.start_frame = start_frame
         self.end_frame = self.total_frames if end_frame is None else end_frame
@@ -391,6 +391,20 @@ class HandEpisode(Dataset):
 
     def __exit__(self, *exc):
         self.close()
+
+    def __getstate__(self):
+        """Drop process-local resources so episodes pickle cleanly.
+
+        Open decoder handles cannot cross process boundaries; a pickled copy
+        (e.g. in a spawned visualization or DataLoader worker) starts with no
+        readers and lazily reopens its own on first frame access, seeking once
+        if that access is non-sequential. The cached pose-cleaning metrics are
+        dropped too and reload from disk on demand.
+        """
+        state = self.__dict__.copy()
+        state["_video_readers"] = {}
+        state["_pose_cleaning_metrics"] = None
+        return state
 
     # ---- frame loading ---------------------------------------------------------
 
