@@ -38,7 +38,7 @@ def main():
 
         visualize_hand_episode_to_mp4(
             episode,
-            os.path.join(args.out_dir, f"handvis_segment{args.segment}.mp4"),
+            os.path.join(args.out_dir, f"{os.path.basename(session_dir.rstrip('/'))}-segment{args.segment}.mp4"),
             downsample=args.downsample,
         )
         visualize_hand_episode_to_rerun(
