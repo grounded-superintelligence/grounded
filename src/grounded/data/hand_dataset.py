@@ -505,3 +505,118 @@ class HandEpisode(Dataset):
         z = uvw[:, 2:3].copy()
         z[np.abs(z) < 1e-9] = 1e-9
         return uvw[:, :2] / z
+
+
+# =============================================================================
+# Episode manifest
+# =============================================================================
+
+
+class HandManifest:
+    """An episode-level index over a session's hand tracking segments.
+
+    Wraps a ``manifest.json`` produced by the manifest-creation post-process
+    (candidate hand intervals chopped into discrete captioned episodes by a
+    VLM, non-work spans discarded). Entries are plain dicts with ``key``,
+    ``segment``, ``frame_start``/``frame_end`` (end **exclusive**),
+    ``duration_s``, ``source_interval`` and ``activity``; captions live in the
+    JSONL the manifest points at and are loaded into :attr:`captions`.
+
+    Usage::
+
+        manifest = HandManifest("downloads/{session}/manifest.json")
+        entry = manifest[3]                # by index, or manifest[entry_key]
+        with manifest.open(3, active_cameras=["left_front"]) as episode:
+            print(episode.caption)         # attached from the captions JSONL
+            frame = episode[0]
+    """
+
+    def __init__(self, manifest_path: Union[str, os.PathLike], session_dir: Optional[str] = None):
+        self.manifest_path = Path(manifest_path).expanduser().resolve()
+        with open(self.manifest_path, "r") as f:
+            self.meta: dict = json.load(f)
+        if self.meta.get("type") != "hand_v2_episode_manifest":
+            raise ValueError(
+                f"{self.manifest_path} is not a hand_v2_episode_manifest (type={self.meta.get('type')!r})"
+            )
+
+        self.episodes: List[dict] = list(self.meta.get("episodes", []))
+        self._by_key: Dict[str, int] = {e["key"]: i for i, e in enumerate(self.episodes)}
+        self.session_dir = self._resolve_session_dir(session_dir)
+        self.captions: Dict[str, str] = self._load_captions()
+
+    def _resolve_session_dir(self, override: Optional[str]) -> str:
+        """The manifest normally lives in the session dir itself; the recorded
+        ``session_dir`` hint covers manifests that were moved elsewhere."""
+        candidates = []
+        if override:
+            candidates.append(Path(override).expanduser())
+        candidates.append(self.manifest_path.parent)
+        if self.meta.get("session_dir"):
+            candidates.append(Path(self.meta["session_dir"]).expanduser())
+        for cand in candidates:
+            if cand.is_dir() and any(cand.glob("processed-segment*")):
+                return str(cand)
+        raise FileNotFoundError(
+            f"Could not locate the session dir for {self.manifest_path} "
+            f"(tried {[str(c) for c in candidates]}); pass session_dir= explicitly."
+        )
+
+    def _load_captions(self) -> Dict[str, str]:
+        captions: Dict[str, str] = {}
+        rel = self.meta.get("captions_path")
+        if not rel:
+            return captions
+        path = self.manifest_path.parent / rel
+        if not path.exists():
+            return captions
+        with open(path, "r") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    captions.update(json.loads(line))
+                except json.JSONDecodeError:
+                    continue
+        return captions
+
+    # ---- entry access ----------------------------------------------------------
+
+    def __len__(self) -> int:
+        return len(self.episodes)
+
+    def __iter__(self):
+        return iter(self.episodes)
+
+    def __getitem__(self, episode: Union[int, str]) -> dict:
+        if isinstance(episode, str):
+            if episode not in self._by_key:
+                raise KeyError(f"No episode {episode!r} in {self.manifest_path}")
+            return self.episodes[self._by_key[episode]]
+        return self.episodes[episode]
+
+    def caption(self, episode: Union[int, str]) -> Optional[str]:
+        return self.captions.get(self[episode]["key"])
+
+    # ---- episode loading ---------------------------------------------------------
+
+    def open(self, episode: Union[int, str], **episode_kwargs) -> HandEpisode:
+        """Opens one manifest entry as a :class:`HandEpisode` restricted to the
+        entry's ``[frame_start, frame_end)`` range.
+
+        Keyword args are forwarded to ``HandEpisode`` (``active_cameras``,
+        ``valid_only``, ...). The entry and its caption ride along as
+        ``episode.manifest_entry`` and ``episode.caption``.
+        """
+        entry = self[episode]
+        ep = HandEpisode(
+            self.session_dir,
+            segment=int(entry["segment"]),
+            start_frame=int(entry["frame_start"]),
+            end_frame=int(entry["frame_end"]),
+            **episode_kwargs,
+        )
+        ep.manifest_entry = entry
+        ep.caption = self.captions.get(entry["key"])
+        return ep

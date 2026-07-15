@@ -1,49 +1,80 @@
-"""Download, load, and render hand tracking v2 for one segment recording.
+"""Load a dataset manifest and render its captioned hand tracking episodes.
+
+The manifest is produced by the manifest-creation post-process (candidate hand
+intervals chopped into discrete captioned episodes by a VLM); see
+HandManifest for the on-disk format.
 
 Usage:
-    python examples/render_hand_tracking.py s3://bucket/path/to/{session} --segment 0
-    python examples/render_hand_tracking.py /local/path/to/{session} --segment 0
+    # list the episodes in a manifest
+    python demo_v1.py --manifest downloads/{session}/manifest.json
+
+    # render one episode (by index or by key) to mp4 + rerun
+    python demo_v1.py --manifest downloads/{session}/manifest.json --episode 3
 """
 
 import argparse
 import os
 
-from grounded.data.hand_dataset import HAND_CAMS, HandEpisode, download_hand_segment
+from grounded.data.hand_dataset import HAND_CAMS, HandManifest
 from grounded.data.visualize_hand import visualize_hand_episode_to_mp4
 from grounded.data.visualize_hand_3d import visualize_hand_episode_to_rerun
 
 
+def list_episodes(manifest: HandManifest):
+    print(
+        f"{len(manifest)} episodes in {manifest.manifest_path} "
+        f"(session {manifest.meta.get('session', '?')}, {manifest.meta.get('total_episode_s', '?')}s total):"
+    )
+    for i, entry in enumerate(manifest):
+        caption = manifest.captions.get(entry["key"], "")
+        print(
+            f"[{i:3d}] segment {entry['segment']:>2} "
+            f"frames [{entry['frame_start']:5d}, {entry['frame_end']:5d}) "
+            f"{entry['duration_s']:5.1f}s  {caption}"
+        )
+
+
 def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("session", help="s3:// URI or local path of the session folder")
-    parser.add_argument("--segment", type=int, default=0)
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--manifest", required=True, help="path to the manifest.json of a downloaded session")
+    parser.add_argument("--episode", default=None,
+                        help="episode index or key to render; omit to list all episodes")
+    parser.add_argument("--session-dir", default=None,
+                        help="session dir override (defaults to the manifest's own directory)")
     parser.add_argument("--cameras", nargs="+", default=HAND_CAMS, choices=HAND_CAMS)
     parser.add_argument("--out-dir", default="outputs")
     parser.add_argument("--downsample", type=int, default=2)
-    parser.add_argument("--aws-profile", default=None)
+    parser.add_argument("--num-workers", type=int, default=8)
     args = parser.parse_args()
 
-    session_dir = args.session
-    if session_dir.startswith("s3://"):
-        session_dir = download_hand_segment(session_dir, args.segment, aws_profile=args.aws_profile, verbose=True)
+    manifest = HandManifest(args.manifest, session_dir=args.session_dir)
 
+    if args.episode is None:
+        list_episodes(manifest)
+        return
+
+    episode_ref = int(args.episode) if args.episode.lstrip("-").isdigit() else args.episode
     os.makedirs(args.out_dir, exist_ok=True)
 
-    with HandEpisode(session_dir, segment=args.segment, active_cameras=args.cameras) as episode:
+    with manifest.open(episode_ref, active_cameras=args.cameras) as episode:
+        entry = episode.manifest_entry
         print(
-            f"Loaded segment {args.segment}: {len(episode)} frames @ {episode.fps:.0f} fps | "
-            f"yield: left {episode.yield_stats['left_pct']}%, right {episode.yield_stats['right_pct']}% | "
-            f"{len(episode.continuous_intervals)} continuous both-hands intervals"
+            f"Loaded {entry['key']}: segment {entry['segment']}, "
+            f"frames [{entry['frame_start']}, {entry['frame_end']}) = "
+            f"{len(episode)} frames @ {episode.fps:.0f} fps"
         )
+        print(f"Caption: {episode.caption}")
 
         visualize_hand_episode_to_mp4(
             episode,
-            os.path.join(args.out_dir, f"{os.path.basename(session_dir.rstrip('/'))}-segment{args.segment}.mp4"),
+            os.path.join(args.out_dir, f"{entry['key']}.mp4"),
             downsample=args.downsample,
+            num_workers=args.num_workers,
+            caption=episode.caption,
         )
         visualize_hand_episode_to_rerun(
             episode,
-            os.path.join(args.out_dir, f"handvis_segment{args.segment}.rrd"),
+            os.path.join(args.out_dir, f"{entry['key']}.rrd"),
         )
 
 

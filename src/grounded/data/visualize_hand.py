@@ -130,6 +130,39 @@ def _draw_hand(img_bgr: np.ndarray, episode: HandEpisode, hand: Optional[HandPos
     return draw_uv_skeleton(img_bgr, uvs, inplace=True)
 
 
+def _append_caption_bar(img_bgr: np.ndarray, caption: str) -> np.ndarray:
+    """Appends a black bar with the word-wrapped caption below the frame.
+
+    The bar height depends only on the caption and frame width, so every frame
+    of an episode keeps identical dimensions.
+    """
+    h, w = img_bgr.shape[:2]
+    scale = max(0.4, w / 1600.0)
+    thickness = max(1, int(round(2 * scale)))
+    pad = max(4, int(round(10 * scale)))
+
+    lines, line = [], ""
+    for word in caption.split():
+        trial = f"{line} {word}".strip()
+        text_w = cv2.getTextSize(trial, cv2.FONT_HERSHEY_SIMPLEX, scale, thickness)[0][0]
+        if line and text_w > w - 2 * pad:
+            lines.append(line)
+            line = word
+        else:
+            line = trial
+    if line:
+        lines.append(line)
+
+    line_h = cv2.getTextSize("Ag", cv2.FONT_HERSHEY_SIMPLEX, scale, thickness)[0][1] + pad
+    bar = np.zeros((pad + line_h * len(lines), w, 3), dtype=img_bgr.dtype)
+    for k, text in enumerate(lines):
+        cv2.putText(
+            bar, text, (pad, (k + 1) * line_h),
+            cv2.FONT_HERSHEY_SIMPLEX, scale, (255, 255, 255), thickness, cv2.LINE_AA,
+        )
+    return np.vstack([img_bgr, bar])
+
+
 def _render_frame(
     episode: HandEpisode,
     frame,
@@ -137,6 +170,7 @@ def _render_frame(
     grid_cols: int,
     downsample: int,
     show_invalid: bool,
+    caption: Optional[str] = None,
 ) -> np.ndarray:
     """Renders one output frame (RGB, ready for the writer)."""
     rgb_by_cam = {
@@ -170,6 +204,9 @@ def _render_frame(
         new_h = int(h * (new_w / w))
         stacked = cv2.resize(stacked, (new_w, new_h))
 
+    if caption:
+        stacked = _append_caption_bar(stacked, caption)
+
     return cv2.cvtColor(stacked, cv2.COLOR_BGR2RGB)
 
 
@@ -194,6 +231,7 @@ def _render_range(
     show_invalid: bool,
     preset: str,
     progress: bool = True,
+    caption: Optional[str] = None,
 ) -> int:
     """Renders frames [start, stop) to output_path. Returns frames written."""
     cams = [c for c in HAND_CAMS if c in episode.active_cameras]
@@ -205,7 +243,7 @@ def _render_range(
     n_written = 0
     try:
         for i in indices:
-            out_rgb = _render_frame(episode, episode[i], cams, grid_cols, downsample, show_invalid)
+            out_rgb = _render_frame(episode, episode[i], cams, grid_cols, downsample, show_invalid, caption)
             if writer is None:
                 writer = _open_writer(output_path, fps, preset)
             writer.append_data(out_rgb)
@@ -279,6 +317,7 @@ def _render_chunk(
     show_invalid: bool,
     preset: str,
     cv2_threads: int,
+    caption: Optional[str] = None,
 ) -> str:
     """Worker: obtains its own episode and renders frames [start, stop)."""
     cv2.setNumThreads(cv2_threads)  # avoid oversubscribing cores across workers
@@ -294,6 +333,7 @@ def _render_chunk(
         show_invalid=show_invalid,
         preset=preset,
         progress=False,
+        caption=caption,
     )
     return output_path
 
@@ -335,6 +375,7 @@ def _visualize_hand_episode_to_mp4(
     show_invalid: bool = True,
     num_workers: int = 1,
     preset: str = "medium",
+    caption: Optional[str] = None,
 ):
     """Renders the hand tracking of an entire episode over its video streams.
 
@@ -357,6 +398,8 @@ def _visualize_hand_episode_to_mp4(
             under `if __name__ == "__main__":` when using workers.
         preset: libx264 speed/quality preset; "veryfast" trades a little
             bitrate efficiency for a much faster encode.
+        caption: optional text drawn in a bar below the camera grid on every
+            frame (e.g. the episode's manifest caption).
     """
     episode_obj = _as_episode(episode)
     if len(episode_obj) == 0:
@@ -382,6 +425,7 @@ def _visualize_hand_episode_to_mp4(
             show_invalid=show_invalid,
             preset=preset,
             progress=True,
+            caption=caption,
         )
         if written > 0:
             print(f"Saved to {output_path}")
@@ -414,6 +458,7 @@ def _visualize_hand_episode_to_mp4(
                     show_invalid,
                     preset,
                     cv2_threads,
+                    caption,
                 )
                 for k in range(num_workers)
             ]
