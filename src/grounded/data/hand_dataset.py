@@ -513,64 +513,71 @@ class HandEpisode(Dataset):
 
 
 class HandManifest:
-    """An episode-level index over a session's hand tracking segments.
+    """An episode-level index over one or more sessions' hand tracking segments.
 
-    Wraps a ``manifest.json`` produced by the manifest-creation post-process
+    Wraps a manifest JSON produced by the manifest-creation post-process
     (candidate hand intervals chopped into discrete captioned episodes by a
     VLM, non-work spans discarded). Entries are plain dicts with ``key``,
-    ``segment``, ``frame_start``/``frame_end`` (end **exclusive**),
-    ``duration_s``, ``source_interval`` and ``activity``; captions live in the
-    JSONL the manifest points at and are loaded into :attr:`captions`.
+    ``session``, ``segment``, ``frame_start``/``frame_end`` (end
+    **exclusive**), ``duration_s``, ``source_interval`` and ``activity``;
+    captions are loaded into :attr:`captions` from ``captions_path`` (default:
+    ``{manifest stem}.captions.jsonl`` next to the manifest).
+
+    Each entry's session folder is resolved under ``sessions_root`` (default:
+    the manifest's own directory), falling back to the root itself for a
+    manifest that lives inside its single session folder.
 
     Usage::
 
-        manifest = HandManifest("downloads/{session}/manifest.json")
+        manifest = HandManifest("manifest.json", sessions_root="downloads")
         entry = manifest[3]                # by index, or manifest[entry_key]
         with manifest.open(3, active_cameras=["left_front"]) as episode:
             print(episode.caption)         # attached from the captions JSONL
             frame = episode[0]
     """
 
-    def __init__(self, manifest_path: Union[str, os.PathLike], session_dir: Optional[str] = None):
+    def __init__(
+        self,
+        manifest_path: Union[str, os.PathLike],
+        sessions_root: Optional[str] = None,
+        captions_path: Optional[Union[str, os.PathLike]] = None,
+    ):
         self.manifest_path = Path(manifest_path).expanduser().resolve()
         with open(self.manifest_path, "r") as f:
             self.meta: dict = json.load(f)
-        if self.meta.get("type") != "hand_v2_episode_manifest":
-            raise ValueError(
-                f"{self.manifest_path} is not a hand_v2_episode_manifest (type={self.meta.get('type')!r})"
-            )
+        if not isinstance(self.meta.get("episodes"), list):
+            raise ValueError(f"{self.manifest_path} is not an episode manifest (no 'episodes' list)")
 
-        self.episodes: List[dict] = list(self.meta.get("episodes", []))
+        self.episodes: List[dict] = list(self.meta["episodes"])
         self._by_key: Dict[str, int] = {e["key"]: i for i, e in enumerate(self.episodes)}
-        self.session_dir = self._resolve_session_dir(session_dir)
+        self._root = Path(sessions_root).expanduser() if sessions_root else self.manifest_path.parent
+        self._session_dirs: Dict[str, str] = {}
+        self.captions_path = (
+            Path(captions_path).expanduser()
+            if captions_path
+            else self.manifest_path.with_name(self.manifest_path.stem + ".captions.jsonl")
+        )
         self.captions: Dict[str, str] = self._load_captions()
 
-    def _resolve_session_dir(self, override: Optional[str]) -> str:
-        """The manifest normally lives in the session dir itself; the recorded
-        ``session_dir`` hint covers manifests that were moved elsewhere."""
-        candidates = []
-        if override:
-            candidates.append(Path(override).expanduser())
-        candidates.append(self.manifest_path.parent)
-        if self.meta.get("session_dir"):
-            candidates.append(Path(self.meta["session_dir"]).expanduser())
-        for cand in candidates:
-            if cand.is_dir() and any(cand.glob("processed-segment*")):
-                return str(cand)
-        raise FileNotFoundError(
-            f"Could not locate the session dir for {self.manifest_path} "
-            f"(tried {[str(c) for c in candidates]}); pass session_dir= explicitly."
-        )
+    def session_dir(self, session: str) -> str:
+        """Resolves (and caches) the folder holding a session's segments."""
+        if session not in self._session_dirs:
+            for cand in (self._root / session, self._root):
+                if cand.is_dir() and any(cand.glob("processed-segment*")):
+                    self._session_dirs[session] = str(cand)
+                    break
+            else:
+                raise FileNotFoundError(
+                    f"Could not locate session {session!r} under {self._root}; "
+                    f"pass sessions_root= explicitly."
+                )
+        return self._session_dirs[session]
 
     def _load_captions(self) -> Dict[str, str]:
         captions: Dict[str, str] = {}
-        rel = self.meta.get("captions_path")
-        if not rel:
+        if not self.captions_path.exists():
             return captions
-        path = self.manifest_path.parent / rel
-        if not path.exists():
-            return captions
-        with open(path, "r") as f:
+        with open(self.captions_path, "r") as f:
             for line in f:
                 line = line.strip()
                 if not line:
@@ -611,7 +618,7 @@ class HandManifest:
         """
         entry = self[episode]
         ep = HandEpisode(
-            self.session_dir,
+            self.session_dir(entry["session"]),
             segment=int(entry["segment"]),
             start_frame=int(entry["frame_start"]),
             end_frame=int(entry["frame_end"]),

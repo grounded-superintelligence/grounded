@@ -5,11 +5,9 @@ intervals chopped into discrete captioned episodes by a VLM); see
 HandManifest for the on-disk format.
 
 Usage:
-    # list the episodes in a manifest
-    python demo_v1.py --manifest downloads/{session}/manifest.json
-
     # render one episode (by index or by key) to mp4 + rerun
-    python demo_v1.py --manifest downloads/{session}/manifest.json --episode 3
+    python demo_v1.py --manifest manifest.json --episode 3
+    python demo_v1.py --manifest manifest.json --captions captions.jsonl --episode {key}
 """
 
 import argparse
@@ -20,38 +18,22 @@ from grounded.data.visualize_hand import visualize_hand_episode_to_mp4
 from grounded.data.visualize_hand_3d import visualize_hand_episode_to_rerun
 
 
-def list_episodes(manifest: HandManifest):
-    print(
-        f"{len(manifest)} episodes in {manifest.manifest_path} "
-        f"(session {manifest.meta.get('session', '?')}, {manifest.meta.get('total_episode_s', '?')}s total):"
-    )
-    for i, entry in enumerate(manifest):
-        caption = manifest.captions.get(entry["key"], "")
-        print(
-            f"[{i:3d}] segment {entry['segment']:>2} "
-            f"frames [{entry['frame_start']:5d}, {entry['frame_end']:5d}) "
-            f"{entry['duration_s']:5.1f}s  {caption}"
-        )
-
-
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--manifest", required=True, help="path to the manifest.json of a downloaded session")
-    parser.add_argument("--episode", default=None,
-                        help="episode index or key to render; omit to list all episodes")
-    parser.add_argument("--session-dir", default=None,
-                        help="session dir override (defaults to the manifest's own directory)")
+    parser.add_argument("--manifest", required=True, help="path to a manifest JSON built over downloaded sessions")
+    parser.add_argument("--episode", required=True,
+                        help="episode index or key to render")
+    parser.add_argument("--captions", default=None,
+                        help="path to the captions JSONL (defaults to {manifest stem}.captions.jsonl)")
+    parser.add_argument("--sessions-root", default=None,
+                        help="dir containing the session folders (defaults to the manifest's own directory)")
     parser.add_argument("--cameras", nargs="+", default=HAND_CAMS, choices=HAND_CAMS)
     parser.add_argument("--out-dir", default="outputs")
     parser.add_argument("--downsample", type=int, default=2)
     parser.add_argument("--num-workers", type=int, default=8)
     args = parser.parse_args()
 
-    manifest = HandManifest(args.manifest, session_dir=args.session_dir)
-
-    if args.episode is None:
-        list_episodes(manifest)
-        return
+    manifest = HandManifest(args.manifest, sessions_root=args.sessions_root, captions_path=args.captions)
 
     episode_ref = int(args.episode) if args.episode.lstrip("-").isdigit() else args.episode
     os.makedirs(args.out_dir, exist_ok=True)
@@ -59,7 +41,7 @@ def main():
     with manifest.open(episode_ref, active_cameras=args.cameras) as episode:
         entry = episode.manifest_entry
         print(
-            f"Loaded {entry['key']}: segment {entry['segment']}, "
+            f"Loaded {entry['key']}: session {entry['session']}, segment {entry['segment']}, "
             f"frames [{entry['frame_start']}, {entry['frame_end']}) = "
             f"{len(episode)} frames @ {episode.fps:.0f} fps"
         )
