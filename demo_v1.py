@@ -1,63 +1,100 @@
-"""Load a dataset manifest and render its captioned hand tracking episodes.
-
-The manifest is produced by the manifest-creation post-process (candidate hand
-intervals chopped into discrete captioned episodes by a VLM); see
-HandManifest for the on-disk format.
+"""Load an asset or episode manifest and render Hand tracking.
 
 Usage:
-    # render one episode (by index or by key) to mp4 + rerun
-    python demo_v1.py --manifest manifest.json --episode 3
-    python demo_v1.py --manifest manifest.json --captions captions.jsonl --episode {key}
+    python demo_v1.py --manifest episodes.json --episode 0
+    python demo_v1.py --manifest episodes.json --episode ep_v1_...
+    python demo_v1.py --manifest assets.json --asset-id ast_v1_...
 """
 
 import argparse
-import os
+from pathlib import Path
 
-from grounded.data.hand_dataset import HAND_CAMS, HandManifest
+from grounded.data.hand_dataset import HAND_CAMS
 from grounded.data.visualize_hand import visualize_hand_episode_to_mp4
 from grounded.data.visualize_hand_3d import visualize_hand_episode_to_rerun
+from grounded.processing import ProcessingClient
+
+
+def _resolve_episode(client: ProcessingClient, reference: str):
+    try:
+        index = int(reference)
+    except ValueError:
+        return client.get_episode(reference)
+
+    episodes = client.list_episodes()
+    try:
+        return episodes[index]
+    except IndexError as exc:
+        raise SystemExit(f"episode index {index} is outside a manifest with {len(episodes)} episode(s)") from exc
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--manifest", required=True, help="path to a manifest JSON built over downloaded sessions")
-    parser.add_argument("--episode", required=True,
-                        help="episode index or key to render")
-    parser.add_argument("--captions", default=None,
-                        help="path to the captions JSONL (defaults to {manifest stem}.captions.jsonl)")
-    parser.add_argument("--sessions-root", default=None,
-                        help="dir containing the session folders (defaults to the manifest's own directory)")
+    parser.add_argument("--manifest", required=True, help="asset or episode manifest")
+    identity = parser.add_mutually_exclusive_group(required=True)
+    identity.add_argument("--episode", help="episode index or episode_id")
+    identity.add_argument("--asset-id", help="asset_id for a full enriched segment")
+    parser.add_argument("--aws-profile", help="optional named AWS profile for s3:// file URIs")
     parser.add_argument("--cameras", nargs="+", default=HAND_CAMS, choices=HAND_CAMS)
     parser.add_argument("--out-dir", default="outputs")
+    parser.add_argument("--target-dir", default="~/.cache/grounded/data")
     parser.add_argument("--downsample", type=int, default=2)
     parser.add_argument("--num-workers", type=int, default=8)
+    parser.add_argument("--allow-missing-sha256", action="store_true")
     args = parser.parse_args()
 
-    manifest = HandManifest(args.manifest, sessions_root=args.sessions_root, captions_path=args.captions)
+    client = ProcessingClient.from_manifest(args.manifest, aws_profile=args.aws_profile)
+    require_sha256 = not args.allow_missing_sha256
 
-    episode_ref = int(args.episode) if args.episode.lstrip("-").isdigit() else args.episode
-    os.makedirs(args.out_dir, exist_ok=True)
-
-    with manifest.open(episode_ref, active_cameras=args.cameras) as episode:
-        entry = episode.manifest_entry
-        print(
-            f"Loaded {entry['key']}: session {entry['session']}, segment {entry['segment']}, "
-            f"frames [{entry['frame_start']}, {entry['frame_end']}) = "
-            f"{len(episode)} frames @ {episode.fps:.0f} fps"
+    if args.episode is not None:
+        record = _resolve_episode(client, args.episode)
+        identifier = record.episode_id
+        caption = record.caption or None
+        download = client.download_episode(
+            identifier,
+            target_dir=args.target_dir,
+            require_sha256=require_sha256,
         )
-        print(f"Caption: {episode.caption}")
+        for lane in download.lanes:
+            print(f"{lane.lane}: {lane.status}, {len(lane.files)} downloaded file(s)")
+    else:
+        identifier = args.asset_id
+        record = client.get_asset(identifier)
+        caption = None
+        for lane in client.list_asset_artifacts(identifier):
+            print(f"{lane.lane}: {lane.status}")
+        download = client.download_asset(
+            identifier,
+            target_dir=args.target_dir,
+            require_sha256=require_sha256,
+        )
+        print(f"Downloaded {len(download.files)} full-segment enrichment file(s)")
 
+    hand = client.open_hand(
+        identifier,
+        target_dir=args.target_dir,
+        active_cameras=args.cameras,
+        require_sha256=require_sha256,
+    )
+    output_dir = Path(args.out_dir).expanduser()
+    output_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        print(f"Loaded {identifier}: {len(hand)} Hand frame(s)")
+        if caption:
+            print(f"Caption: {caption}")
         visualize_hand_episode_to_mp4(
-            episode,
-            os.path.join(args.out_dir, f"{entry['key']}.mp4"),
+            hand,
+            str(output_dir / f"{identifier}.mp4"),
             downsample=args.downsample,
             num_workers=args.num_workers,
-            caption=episode.caption,
+            caption=caption,
         )
         visualize_hand_episode_to_rerun(
-            episode,
-            os.path.join(args.out_dir, f"{entry['key']}.rrd"),
+            hand,
+            str(output_dir / f"{identifier}.rrd"),
         )
+    finally:
+        hand.close()
 
 
 if __name__ == "__main__":

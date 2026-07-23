@@ -16,23 +16,114 @@
 ```
 
 ## setup
-First download `conda` or your preferred Python environment manager.
+
+Grounded requires Python 3.10 or newer. Install it from a source checkout:
 
 ```bash
-conda create -n grounded python=3.10
-conda activate grounded
-python -m pip install git+https://github.com/grounded-superintelligence/grounded.git
+python -m pip install .
 ```
+
+A wheel can be installed with `python -m pip install grounded-1.0.0-py3-none-any.whl`.
+Publishing that wheel to PyPI later would only change the install command.
 
 ## usage
 
 ### v1
-The latest version is still in development. You can checkout `v1.0.0` branch to use the implementation. See `demo_v1.py` for how to visualize a whole hand tracking session.
 
-### v0
-You should be given an `index.json`, `captions.jsonl`, and `credentials` that corresponds your proprietary dataset. Add the contents of `credentials` to your `~/.aws/credentials` file. Below is a basic snippet of the basic modules present in `grounded` SDK:
+An `asset_id` identifies one full enriched segment. An `episode_id` identifies
+one captioned clip inside that segment.
+
+A delivery includes a JSON manifest plus access to the exact files it
+references. No API server is required.
+
+The quickest validation uses the existing Python demo:
+
+```bash
+# Render one captioned episode.
+python demo_v1.py \
+  --manifest /path/to/manifest.json \
+  --episode 0
+
+# Render one full segment. Downsample for a faster preview.
+python demo_v1.py \
+  --manifest /path/to/manifest.json \
+  --asset-id ast_v1_... \
+  --cameras left_front \
+  --downsample 4 \
+  --num-workers 4
+```
+
+Both commands download every available enrichment lane, report unavailable or
+partial lanes, and write an MP4 and Rerun `.rrd` file under `outputs/`. Downloads
+are cached under `~/.cache/grounded/data`.
+
+Numeric episode indexes follow the row order in the supplied manifest.
+
+If a legacy manifest does not include SHA-256 checksums, add
+`--allow-missing-sha256`. New manifests should include checksums.
+
+### manifest access
+
+The SDK supports two delivery options:
+
+- A manifest containing presigned HTTPS URLs works without AWS credentials.
+  The URLs stop working at their stated expiration time.
+- A manifest containing `s3://` URIs uses the normal AWS credential chain.
+  Pass `--aws-profile PROFILE` to the demo when using a named local profile.
+
+Credentials are never stored in the manifest or packaged in the SDK.
+
+The same flow can be used directly from Python:
 
 ```python
+from grounded.data.visualize_hand import visualize_hand_episode_to_mp4
+from grounded.processing import ProcessingClient
+
+client = ProcessingClient.from_manifest("manifest.json")
+record = client.list_episodes()[0]
+
+episode = client.open_hand(record.episode_id, active_cameras=["left_front"])
+try:
+    visualize_hand_episode_to_mp4(
+        episode,
+        "episode.mp4",
+        caption=episode.caption,
+    )
+finally:
+    episode.close()
+```
+
+To download every published enrichment for a full segment from an asset
+manifest:
+
+```python
+client = ProcessingClient.from_manifest("assets.json")
+download = client.download_asset("ast_v1_...")
+
+# Or download selected lanes only.
+hand = client.download_asset("ast_v1_...", lanes=["hand"])
+
+# Open and visualize the full Hand segment.
+episode = client.open_hand("ast_v1_...", active_cameras=["left_front"])
+```
+
+`ProcessingClient.from_api(...)` is available if Grounded later provides an
+HTTP API URL. It is not required for manifest-based delivery. Storage access is
+granted separately and is never embedded in the SDK.
+
+See [`docs/ASSET_EPISODE_FLOW.md`](docs/ASSET_EPISODE_FLOW.md) for the complete
+asset and episode control flow.
+
+### v0
+You should be given an `index.json` and `captions.jsonl` for your proprietary
+dataset. Dataset access is granted separately through the standard AWS
+credential chain (for example, an instance role or named local profile);
+credentials are never packaged with the index, API, or SDK. Below is a basic
+snippet of the modules present in the `grounded` SDK:
+
+```python
+import os
+
 from grounded.data.ego_dataset import EgoDataset, EgoEpisode
 from grounded.data.visualize import visualize_episode_to_mp4
 from grounded.data.visualize_3d import visualize_episode_to_rerun
