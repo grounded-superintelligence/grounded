@@ -77,10 +77,12 @@ granted separately and is never embedded in the SDK.
 See [`docs/ASSET_EPISODE_FLOW.md`](docs/ASSET_EPISODE_FLOW.md) for the complete
 asset and episode control flow.
 
-The included demo downloads and visualizes one manifest episode:
+The included Python demo downloads every available lane and creates both MP4
+and Rerun visualizations:
 
 ```bash
-grounded-demo --manifest manifest.json --episode 0
+python demo_v1.py --manifest episodes.json --episode 0
+python demo_v1.py --manifest assets.json --asset-id ast_v1_...
 ```
 
 ### v0

@@ -46,12 +46,12 @@ the producer-published clip and carries its caption.
 After installing the SDK from a wheel or source checkout:
 
 ```bash
-grounded-demo --manifest manifest.json --episode 0
+python demo_v1.py --manifest episodes.json --episode 0
+python demo_v1.py --manifest assets.json --asset-id ast_v1_...
 ```
 
-Add `--download-all` to download every available Hand, SLAM, and depth lane
-before rendering Hand. For a full segment, use `--asset-id ast_v1_...` with an
-asset manifest.
+The demo downloads every available Hand, SLAM, and depth lane before rendering
+Hand. Unavailable lanes are reported without placeholder files.
 
 ## Visualize a captioned episode
 
