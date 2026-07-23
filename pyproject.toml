@@ -26,6 +26,9 @@ dependencies = [
     "tqdm",
 ]
 
+[project.scripts]
+grounded-demo = "grounded.demo:main"
+
 [project.optional-dependencies]
 dev = [
     "pre-commit",
