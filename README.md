@@ -21,17 +21,11 @@ Grounded requires Python 3.10 or newer. Install it from a source checkout:
 
 ```bash
 python -m pip install .
+# or
+python -m pip install git+https://github.com/grounded-superintelligence/grounded.git
 ```
 
-A wheel can be installed with `python -m pip install grounded-1.0.0-py3-none-any.whl`.
-Publishing that wheel to PyPI later would only change the install command.
-
 ## usage
-
-### v1
-
-An `asset_id` identifies one full enriched segment. An `episode_id` identifies
-one captioned clip inside that segment.
 
 A delivery includes a JSON manifest plus access to the exact files it
 references. No API server is required.
@@ -39,23 +33,13 @@ references. No API server is required.
 The quickest validation uses the existing Python demo:
 
 ```bash
-# Render one captioned episode.
-python demo_v1.py \
-  --manifest /path/to/manifest.json \
-  --episode 0
-
-# Render one full segment. Downsample for a faster preview.
-python demo_v1.py \
-  --manifest /path/to/manifest.json \
-  --asset-id ast_v1_... \
-  --cameras left_front \
-  --downsample 4 \
-  --num-workers 4
+python demo.py --manifest /path/to/manifest.json --episode 0
 ```
 
 Both commands download every available enrichment lane, report unavailable or
-partial lanes, and write an MP4 and Rerun `.rrd` file under `outputs/`. Downloads
-are cached under `~/.cache/grounded/data`.
+partial lanes, and write an MP4 (camera grid with hand skeletons) and a Rerun
+`.rrd` file (world-frame when the SLAM lane is available) under `outputs/`.
+Downloads are cached under `~/.cache/grounded/data`.
 
 Numeric episode indexes follow the row order in the supplied manifest.
 
@@ -76,8 +60,9 @@ Credentials are never stored in the manifest or packaged in the SDK.
 The same flow can be used directly from Python:
 
 ```python
+# see demo.py for reference
+from grounded.data.processing import ProcessingClient
 from grounded.data.visualize_hand import visualize_hand_episode_to_mp4
-from grounded.processing import ProcessingClient
 
 client = ProcessingClient.from_manifest("manifest.json")
 record = client.list_episodes()[0]
@@ -112,57 +97,5 @@ HTTP API URL. It is not required for manifest-based delivery. Storage access is
 granted separately and is never embedded in the SDK.
 
 See [`docs/ASSET_EPISODE_FLOW.md`](docs/ASSET_EPISODE_FLOW.md) for the complete
-asset and episode control flow.
-
-### v0
-You should be given an `index.json` and `captions.jsonl` for your proprietary
-dataset. Dataset access is granted separately through the standard AWS
-credential chain (for example, an instance role or named local profile);
-credentials are never packaged with the index, API, or SDK. Below is a basic
-snippet of the modules present in the `grounded` SDK:
-
-```python
-import os
-
-from grounded.data.ego_dataset import EgoDataset, EgoEpisode
-from grounded.data.visualize import visualize_episode_to_mp4
-from grounded.data.visualize_3d import visualize_episode_to_rerun
-
-INDEX_JSON = "index.json"  # change this to your path
-CAPTIONS_JSONL = "captions.jsonl"  # change this to your path
-EPISODE_IDX = 0
-
-# load dataset & episode
-dataset = EgoDataset(
-    index_path=INDEX_JSON,
-    captions_path=CAPTIONS_JSONL,
-    active_cameras=["left-front", "right-front"],
-    target_dir="~/.cache/grounded/data",
-    min_duration_sec=4,
-)
-episode = dataset[EPISODE_IDX]
-
-os.makedirs("outputs/", exist_ok=True)
-
-# print caption
-print(dataset.get_caption(EPISODE_IDX))
-# print(dataset[EPISODE_IDX].caption)  # alternate way to get caption, but will download all episode files
-
-# generate mp4 render
-visualize_episode_to_mp4(
-    episode=episode,
-    output_path=f"outputs/sdkvis{EPISODE_IDX}.mp4",
-    downsample=4,
-    fps=30,
-    max_workers=16,
-    max_depth=5,
-)
-
-# generate rerun 3d
-visualize_episode_to_rerun(
-    episode=episode,
-    output_path=f"outputs/sdkvis{EPISODE_IDX}.rrd",
-)
-```
-
-Refer to `docs/DATA.md` for the exact specifications of all parameters used in this library.
+asset and episode control flow, and [`docs/DATA.md`](docs/DATA.md) for the
+exact specification of every array the readers expose.
