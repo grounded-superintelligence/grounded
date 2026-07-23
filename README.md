@@ -17,35 +17,42 @@
 
 ## setup
 
-Grounded requires Python 3.10 or newer. Install it from a source checkout:
+Install the API and manifest client from a source checkout:
 
 ```bash
-python -m pip install .
+git clone https://github.com/grounded-superintelligence/grounded.git
+cd grounded
+git checkout v1.0.0
+python -m pip install -e .
 ```
 
-A wheel can be installed with `python -m pip install grounded-1.0.0-py3-none-any.whl`.
-Publishing that wheel to PyPI later would only change the install command.
+Install the visualization dependencies when rendering MP4 or Rerun files:
+
+```bash
+python -m pip install -e ".[visualization]"
+```
+
+The prepared PyPI distribution name is `grounded-sdk`. After its first public
+release, install it with `python -m pip install grounded-sdk` or
+`python -m pip install "grounded-sdk[visualization]"`.
 
 ## usage
 
 ### v1
 
-An `asset_id` identifies one full enriched segment. An `episode_id` identifies
-one captioned clip inside that segment.
-
-A delivery includes a JSON manifest plus access to the exact files it
-references. No API server is required.
-
-The quickest validation uses the existing Python demo:
+A manifest can contain captioned episodes or full enriched segments. Render an
+episode by its row number or `episode_id`:
 
 ```bash
-# Render one captioned episode.
-python demo_v1.py \
+python demo.py \
   --manifest /path/to/manifest.json \
   --episode 0
+```
 
-# Render one full segment. Downsample for a faster preview.
-python demo_v1.py \
+To render a full segment from an asset manifest:
+
+```bash
+python demo.py \
   --manifest /path/to/manifest.json \
   --asset-id ast_v1_... \
   --cameras left_front \
@@ -53,116 +60,39 @@ python demo_v1.py \
   --num-workers 4
 ```
 
-Both commands download every available enrichment lane, report unavailable or
-partial lanes, and write an MP4 and Rerun `.rrd` file under `outputs/`. Downloads
-are cached under `~/.cache/grounded/data`.
+The demo downloads the published enrichment files, reports missing or partial
+lanes, and renders Hand tracking to MP4 and Rerun `.rrd` files under `outputs/`.
+Downloads are cached under `~/.cache/grounded/data`.
 
-Numeric episode indexes follow the row order in the supplied manifest.
+Presigned manifests require no AWS credentials. Manifests containing `s3://`
+URIs require the `s3` or `visualization` extra and use the normal AWS credential
+chain; pass `--aws-profile PROFILE` when using a named profile. Add
+`--allow-missing-sha256` only for legacy manifests without checksums.
 
-If a legacy manifest does not include SHA-256 checksums, add
-`--allow-missing-sha256`. New manifests should include checksums.
-
-### manifest access
-
-The SDK supports two delivery options:
-
-- A manifest containing presigned HTTPS URLs works without AWS credentials.
-  The URLs stop working at their stated expiration time.
-- A manifest containing `s3://` URIs uses the normal AWS credential chain.
-  Pass `--aws-profile PROFILE` to the demo when using a named local profile.
-
-Credentials are never stored in the manifest or packaged in the SDK.
-
-The same flow can be used directly from Python:
-
-```python
-from grounded.data.visualize_hand import visualize_hand_episode_to_mp4
-from grounded.processing import ProcessingClient
-
-client = ProcessingClient.from_manifest("manifest.json")
-record = client.list_episodes()[0]
-
-episode = client.open_hand(record.episode_id, active_cameras=["left_front"])
-try:
-    visualize_hand_episode_to_mp4(
-        episode,
-        "episode.mp4",
-        caption=episode.caption,
-    )
-finally:
-    episode.close()
-```
-
-To download every published enrichment for a full segment from an asset
-manifest:
-
-```python
-client = ProcessingClient.from_manifest("assets.json")
-download = client.download_asset("ast_v1_...")
-
-# Or download selected lanes only.
-hand = client.download_asset("ast_v1_...", lanes=["hand"])
-
-# Open and visualize the full Hand segment.
-episode = client.open_hand("ast_v1_...", active_cameras=["left_front"])
-```
-
-`ProcessingClient.from_api(...)` is available if Grounded later provides an
-HTTP API URL. It is not required for manifest-based delivery. Storage access is
-granted separately and is never embedded in the SDK.
-
-See [`docs/ASSET_EPISODE_FLOW.md`](docs/ASSET_EPISODE_FLOW.md) for the complete
-asset and episode control flow.
-
-### v0
-You should be given an `index.json` and `captions.jsonl` for your proprietary
-dataset. Dataset access is granted separately through the standard AWS
-credential chain (for example, an instance role or named local profile);
-credentials are never packaged with the index, API, or SDK. Below is a basic
-snippet of the modules present in the `grounded` SDK:
+The same client can connect to a hosted API:
 
 ```python
 import os
 
-from grounded.data.ego_dataset import EgoDataset, EgoEpisode
-from grounded.data.visualize import visualize_episode_to_mp4
-from grounded.data.visualize_3d import visualize_episode_to_rerun
+from grounded.data.processing import ProcessingClient
 
-INDEX_JSON = "index.json"  # change this to your path
-CAPTIONS_JSONL = "captions.jsonl"  # change this to your path
-EPISODE_IDX = 0
-
-# load dataset & episode
-dataset = EgoDataset(
-    index_path=INDEX_JSON,
-    captions_path=CAPTIONS_JSONL,
-    active_cameras=["left-front", "right-front"],
-    target_dir="~/.cache/grounded/data",
-    min_duration_sec=4,
-)
-episode = dataset[EPISODE_IDX]
-
-os.makedirs("outputs/", exist_ok=True)
-
-# print caption
-print(dataset.get_caption(EPISODE_IDX))
-# print(dataset[EPISODE_IDX].caption)  # alternate way to get caption, but will download all episode files
-
-# generate mp4 render
-visualize_episode_to_mp4(
-    episode=episode,
-    output_path=f"outputs/sdkvis{EPISODE_IDX}.mp4",
-    downsample=4,
-    fps=30,
-    max_workers=16,
-    max_depth=5,
+client = ProcessingClient.from_api(
+    os.environ["GROUNDED_API_URL"],
+    bearer_token=os.environ["GROUNDED_API_TOKEN"],
 )
 
-# generate rerun 3d
-visualize_episode_to_rerun(
-    episode=episode,
-    output_path=f"outputs/sdkvis{EPISODE_IDX}.rrd",
-)
+assets = client.list_assets(lane="hand", status="available")
+asset = client.get_asset(assets.assets[0].asset_id)
+download = client.download_asset(asset.asset_id)
+
+episode = client.get_episode("ep_v1_...")
+hand_only = client.download_episode(episode.episode_id, lane="hand")
 ```
 
-Refer to `docs/DATA.md` for the exact specifications of all parameters used in this library.
+The API or manifest supplies exact files and reports each lane as available,
+partial, not processed, or failed. Storage credentials are never packaged in
+the SDK.
+
+See [`docs/ASSET_EPISODE_FLOW.md`](docs/ASSET_EPISODE_FLOW.md) for the complete
+asset, episode, download, and visualization flow. Refer to
+[`docs/DATA.md`](docs/DATA.md) for the data structures exposed by the SDK.

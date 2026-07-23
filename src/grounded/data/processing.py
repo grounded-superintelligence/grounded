@@ -409,7 +409,7 @@ def _asset_from_mapping(value: Mapping[str, Any], *, strict: bool = False) -> As
     return AssetRecord(
         asset_id=_required_text(value.get("asset_id"), field_name="asset_id"),
         segment=segment,
-        source_uri=_required_text(value.get("source_uri"), field_name="source_uri"),
+        source_uri=str(value.get("source_uri") or ""),
         artifacts=artifacts,
         provenance=dict(value.get("provenance") or {}),
         timebase=dict(value.get("timebase") or {}),
