@@ -46,12 +46,26 @@ the producer-published clip and carries its caption.
 After installing the SDK from a wheel or source checkout:
 
 ```bash
-python demo_v1.py --manifest episodes.json --episode 0
-python demo_v1.py --manifest assets.json --asset-id ast_v1_...
+python demo_v1.py --manifest /path/to/manifest.json --episode 0
+python demo_v1.py \
+  --manifest /path/to/manifest.json \
+  --asset-id ast_v1_... \
+  --cameras left_front \
+  --downsample 4 \
+  --num-workers 4
 ```
 
 The demo downloads every available Hand, SLAM, and depth lane before rendering
-Hand. Unavailable lanes are reported without placeholder files.
+Hand. Unavailable lanes are reported without placeholder files. It writes an
+MP4 and Rerun `.rrd` file under `outputs/`, and reuses downloads cached under
+`~/.cache/grounded/data`.
+
+For a presigned manifest, no AWS credentials are required. For a manifest with
+`s3://` file URIs, use the normal AWS credential chain or pass
+`--aws-profile PROFILE`. Credentials are not stored in either manifest type.
+
+Add `--allow-missing-sha256` only when validating a legacy manifest whose
+producer did not publish checksums.
 
 ## Visualize a captioned episode
 
