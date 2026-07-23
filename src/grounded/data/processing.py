@@ -31,9 +31,7 @@ EMPTY_ASSET_STATUSES = frozenset({"not_processed", "failed"})
 EPISODE_LANE_STATUSES = frozenset({"available", "partial", "not_processed", "failed"})
 DOWNLOADABLE_EPISODE_LANE_STATUSES = frozenset({"available", "partial"})
 REQUIRED_EPISODE_LANES = frozenset({"hand", "slam", "depth"})
-PROCESS_RECEIPT_STATES = frozenset(
-    {"accepted", "already_running", "already_available", "retry_required", "not_supported"}
-)
+PROCESS_RECEIPT_STATES = frozenset({"accepted", "already_running", "already_available", "retry_required", "not_supported"})
 
 
 def _expected_episode_id(*, asset_id: str, start_ns: Any, end_ns: Any) -> str:
@@ -1238,7 +1236,7 @@ class ProcessingClient:
     ) -> Any:
         """Download and open the full Hand recording for one segment asset."""
 
-        from grounded.data.hand_dataset import HandEpisode
+        from grounded.data.ego_dataset import HandEpisode
 
         asset = self.get_asset(asset_id)
         download = self.download_asset(
@@ -1267,7 +1265,7 @@ class ProcessingClient:
     ) -> Any:
         """Download and open one clipped Hand episode, including its caption."""
 
-        from grounded.data.hand_dataset import ClippedHandEpisode
+        from grounded.data.ego_dataset import ClippedHandEpisode
 
         record = self.get_episode(episode_id)
         download = self.download_episode(

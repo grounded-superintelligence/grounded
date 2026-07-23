@@ -9,8 +9,8 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from grounded.data.hand_dataset import ClippedHandEpisode, HandEpisode
-from grounded.processing import (
+from grounded.data.ego_dataset import ClippedHandEpisode, HandEpisode
+from grounded.data.processing import (
     AssetDownload,
     DownloadedAssetFile,
     DownloadedEpisodeFile,
@@ -130,9 +130,7 @@ def _build_full_hand_archive(tmp_path: Path, *, malicious_member: bool = False) 
         (save_dataset_dir / f"{camera}.mp4").write_bytes(b"test video bytes")
     np.savez(save_dataset_dir / "camera_params.npz", **camera_values)
     (save_dataset_dir / "yield.json").write_text(json.dumps({"total_frames": 2}))
-    (save_dataset_dir / "continuous_intervals.json").write_text(
-        json.dumps({"both_intervals": [{"start": 0, "end": 1}]})
-    )
+    (save_dataset_dir / "continuous_intervals.json").write_text(json.dumps({"both_intervals": [{"start": 0, "end": 1}]}))
 
     archive_path = tmp_path / "hand_v2_outputs.tar"
     with tarfile.open(archive_path, mode="w") as archive:
