@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pytest
 
-from grounded.processing import (
+from grounded.data.processing import (
     ASSET_CONTRACT_VERSION,
     ASSET_LIST_CONTRACT_VERSION,
     PROCESS_RECEIPT_CONTRACT_VERSION,

@@ -39,7 +39,6 @@ s3 = [
     "botocore[crt]>=1.34",
 ]
 visualization = [
-    "av",
     "boto3>=1.34",
     "botocore[crt]>=1.34",
     "filelock",
@@ -49,7 +48,6 @@ visualization = [
     "opencv-python",
     "rerun-sdk",
     "scipy",
-    "torch",
     "tqdm",
 ]
 dev = [

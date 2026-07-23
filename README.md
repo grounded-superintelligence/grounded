@@ -33,8 +33,8 @@ python -m pip install -e ".[visualization]"
 ```
 
 The prepared PyPI distribution name is `grounded-sdk`. After its first public
-release, the equivalent commands will be `python -m pip install grounded-sdk`
-and `python -m pip install "grounded-sdk[visualization]"`.
+release, install it with `python -m pip install grounded-sdk` or
+`python -m pip install "grounded-sdk[visualization]"`.
 
 ## usage
 
@@ -44,7 +44,7 @@ A manifest can contain captioned episodes or full enriched segments. Render an
 episode by its row number or `episode_id`:
 
 ```bash
-python demo_v1.py \
+python demo.py \
   --manifest /path/to/manifest.json \
   --episode 0
 ```
@@ -52,7 +52,7 @@ python demo_v1.py \
 To render a full segment from an asset manifest:
 
 ```bash
-python demo_v1.py \
+python demo.py \
   --manifest /path/to/manifest.json \
   --asset-id ast_v1_... \
   --cameras left_front \
@@ -74,7 +74,7 @@ The same client can connect to a hosted API:
 ```python
 import os
 
-from grounded.processing import ProcessingClient
+from grounded.data.processing import ProcessingClient
 
 client = ProcessingClient.from_api(
     os.environ["GROUNDED_API_URL"],
@@ -93,55 +93,6 @@ The API or manifest supplies exact files and reports each lane as available,
 partial, not processed, or failed. Storage credentials are never packaged in
 the SDK.
 
-### v0
-You should be given an `index.json` and `captions.jsonl` for your proprietary
-dataset. Dataset access is granted separately through the standard AWS
-credential chain (for example, an instance role or named local profile);
-credentials are never packaged with the index, API, or SDK. Below is a basic
-snippet of the modules present in the `grounded` SDK:
-
-```python
-import os
-
-from grounded.data.ego_dataset import EgoDataset, EgoEpisode
-from grounded.data.visualize import visualize_episode_to_mp4
-from grounded.data.visualize_3d import visualize_episode_to_rerun
-
-INDEX_JSON = "index.json"  # change this to your path
-CAPTIONS_JSONL = "captions.jsonl"  # change this to your path
-EPISODE_IDX = 0
-
-# load dataset & episode
-dataset = EgoDataset(
-    index_path=INDEX_JSON,
-    captions_path=CAPTIONS_JSONL,
-    active_cameras=["left-front", "right-front"],
-    target_dir="~/.cache/grounded/data",
-    min_duration_sec=4,
-)
-episode = dataset[EPISODE_IDX]
-
-os.makedirs("outputs/", exist_ok=True)
-
-# print caption
-print(dataset.get_caption(EPISODE_IDX))
-# print(dataset[EPISODE_IDX].caption)  # alternate way to get caption, but will download all episode files
-
-# generate mp4 render
-visualize_episode_to_mp4(
-    episode=episode,
-    output_path=f"outputs/sdkvis{EPISODE_IDX}.mp4",
-    downsample=4,
-    fps=30,
-    max_workers=16,
-    max_depth=5,
-)
-
-# generate rerun 3d
-visualize_episode_to_rerun(
-    episode=episode,
-    output_path=f"outputs/sdkvis{EPISODE_IDX}.rrd",
-)
-```
-
-Refer to `docs/DATA.md` for the exact specifications of all parameters used in this library.
+See [`docs/ASSET_EPISODE_FLOW.md`](docs/ASSET_EPISODE_FLOW.md) for the complete
+asset, episode, download, and visualization flow. Refer to
+[`docs/DATA.md`](docs/DATA.md) for the data structures exposed by the SDK.

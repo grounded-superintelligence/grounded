@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from grounded.processing import (
+from grounded.data.processing import (
     EPISODE_CONTRACT_VERSION,
     EpisodeLaneNotFoundError,
     EpisodeNotFoundError,

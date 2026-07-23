@@ -22,7 +22,7 @@ No long-lived PyPI token is required.
    ```bash
    python -m pip install ".[dev]"
    python -m pytest
-   python -m ruff check src tests demo_v0.py demo_v1.py
+   python -m ruff check src tests demo.py
    python -m build
    python -m twine check dist/*
    ```

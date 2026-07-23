@@ -9,10 +9,18 @@ Usage:
 import argparse
 from pathlib import Path
 
-from grounded.data.hand_dataset import HAND_CAMS
+from grounded.data.ego_dataset import HAND_CAMS
+from grounded.data.processing import ProcessingClient
 from grounded.data.visualize_hand import visualize_hand_episode_to_mp4
 from grounded.data.visualize_hand_3d import visualize_hand_episode_to_rerun
-from grounded.processing import ProcessingClient
+
+
+def _slam_trajectory_path(downloaded_files) -> str | None:
+    """Local path of the SLAM lane's TUM trajectory, if it was downloaded."""
+    for item in downloaded_files:
+        if str(getattr(item, "lane", "")).lower() == "slam" and Path(str(item.local_path)).name == "trajectory.txt":
+            return str(item.local_path)
+    return None
 
 
 def _resolve_episode(client: ProcessingClient, reference: str):
@@ -89,9 +97,13 @@ def main():
             num_workers=args.num_workers,
             caption=caption,
         )
+        trajectory_path = _slam_trajectory_path(download.files)
+        if trajectory_path is None:
+            print("No SLAM trajectory downloaded; the Rerun file will stay in the camera frame.")
         visualize_hand_episode_to_rerun(
             hand,
             str(output_dir / f"{identifier}.rrd"),
+            trajectory_path=trajectory_path,
         )
     finally:
         hand.close()

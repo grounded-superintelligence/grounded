@@ -26,7 +26,7 @@ import imageio.v2 as imageio
 import numpy as np
 from tqdm import tqdm
 
-from grounded.data.hand_dataset import HAND_CAMS, HandEpisode, HandPose
+from grounded.data.ego_dataset import HAND_CAMS, HandEpisode, HandPose
 
 # The episode can be given as the object itself, a recording path, or a
 # zero-arg callable that builds one (for constructors that need more than a
@@ -136,7 +136,7 @@ def _append_caption_bar(img_bgr: np.ndarray, caption: str) -> np.ndarray:
     The bar height depends only on the caption and frame width, so every frame
     of an episode keeps identical dimensions.
     """
-    h, w = img_bgr.shape[:2]
+    w = img_bgr.shape[1]
     scale = max(0.4, w / 1600.0)
     thickness = max(1, int(round(2 * scale)))
     pad = max(4, int(round(10 * scale)))
@@ -157,8 +157,14 @@ def _append_caption_bar(img_bgr: np.ndarray, caption: str) -> np.ndarray:
     bar = np.zeros((pad + line_h * len(lines), w, 3), dtype=img_bgr.dtype)
     for k, text in enumerate(lines):
         cv2.putText(
-            bar, text, (pad, (k + 1) * line_h),
-            cv2.FONT_HERSHEY_SIMPLEX, scale, (255, 255, 255), thickness, cv2.LINE_AA,
+            bar,
+            text,
+            (pad, (k + 1) * line_h),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            scale,
+            (255, 255, 255),
+            thickness,
+            cv2.LINE_AA,
         )
     return np.vstack([img_bgr, bar])
 

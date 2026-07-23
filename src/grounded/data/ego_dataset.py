@@ -1,1146 +1,1313 @@
 """
-A simple dataset abstraction over GSI data.
+A dataset abstraction over GSI hand tracking (v2) outputs.
+
+Hand tracking v2 replaces the per-frame ``left``/``right`` dict format of the
+v0.2.x SDK with a flat, MANO-parametric per-frame npz, and it replaces the
+rectified left-front reference frame with the **unrectified left-front camera
+frame**.
+
+Scope: hand tracking only. SLAM and depth are served by separate APIs and are
+intentionally not loaded here.
+
+On-disk layout (per session, per segment)::
+
+    {session}/
+      processed-segment{N}/
+        hand_v2_outputs.tar                      # as stored on S3
+        hand/                                    # tar extracted here
+          hand_tracking/
+            refinement/params/frame_{i:06d}.npz  # per-frame MANO fits
+            save_dataset/
+              camera_params.npz                  # intrinsics + extrinsics (all 4 cams)
+              continuous_intervals.json          # inclusive [start, end] runs, both hands valid
+              yield.json                         # per-hand validity counts
+              {left,right}_{front,eye}.mp4       # unrectified (undistorted pinhole) streams
+            pose_cleaning/metrics_pose_cleaning.json
 """
 
-import bisect
-import io
+import hashlib
 import json
 import os
 import posixpath
+import re
 import shutil
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import tarfile
+import tempfile
 from dataclasses import dataclass
-from pathlib import Path
-from typing import List, Optional, Union
+from pathlib import Path, PurePosixPath
+from typing import TYPE_CHECKING, Dict, List, Optional, Union
 from urllib.parse import urlparse
 
-import boto3
-import botocore
 import cv2
-import filelock
 import numpy as np
-from scipy.spatial.transform import Rotation as R, Slerp
-from torch.utils.data import Dataset
-from tqdm.auto import tqdm
+
+if TYPE_CHECKING:
+    from grounded.data.processing import AssetDownload, EpisodeDownload
+
+try:  # torch is a declared dependency of the SDK, but hand-only readers can live without it
+    from torch.utils.data import Dataset
+except ImportError:  # pragma: no cover
+    Dataset = object
 
 GROUNDED_DIR_DEFAULT = os.path.expanduser("~/.cache/grounded/data/")
 LOCKS_DIR_DEFAULT = os.path.expanduser("~/.cache/grounded/locks/")
 
-JPG_QUALITY_ON_WRITE = 95
+HAND_TAR_NAME_DEFAULT = "hand_v2_outputs.tar"
+CLIPPED_HAND_SCHEMA_VERSION = "grounded.episode.hand_clip.v1alpha1"
+CLIPPED_POSE_TAR_NAME = "pose_frames.tar"
+CLIPPED_POSE_PREFIX = ("hand", "pose_interpolation", "params")
+CLIPPED_POSE_FILENAME = re.compile(r"frame_(\d{6,})\.npz")
+
+# Camera naming follows the v2 pipeline (underscores). Order matters: it is the
+# view axis of ``HandPose.inlier_mask``.
+HAND_CAMS = ["left_front", "right_front", "left_eye", "right_eye"]
+
+SIDES = ("left", "right")
 
 
-def _parse_wrist_pose_from_hand(hand_dict: Optional[dict]) -> Optional[np.ndarray]:
-    """Build a 4x4 wrist pose (rect left-front frame) from a full hand dict.
-
-    The hand dict is what `npz["left"|"right"].item()` returns; it holds the
-    fitted root pose as R_world_hand (3x3) + t_world_hand (3,) at the top level.
-    Returns None only if those keys are absent (an undetected hand), which the
-    interpolation pass treats as a gap. The rotation's shape/validity is a
-    dataset invariant (always a proper 3x3), so it is not re-checked here.
-    """
-    if not isinstance(hand_dict, dict):
-        return None
-    Rm = hand_dict.get("R_world_hand")
-    t = hand_dict.get("t_world_hand")
-    if Rm is None or t is None:
-        return None
-    T = np.eye(4)
-    T[:3, :3] = np.asarray(Rm, dtype=np.float64)
-    T[:3, 3] = np.asarray(t, dtype=np.float64).reshape(3)
-    return T
-
-
-def _pose_is_missing(T: Optional[np.ndarray]) -> bool:
-    return T is None or not np.isfinite(np.asarray(T)).all() or np.all(np.asarray(T)[:3, :3] == 0)
-
-
-def _mat4x4_to_pos_quat(T: Optional[np.ndarray]) -> Optional[np.ndarray]:
-    """Convert a 4x4 pose to 7D [tx, ty, tz, qx, qy, qz, qw] (same layout as c2w).
-
-    Returns None if the pose is missing/degenerate.
-    """
-    if _pose_is_missing(T):
-        return None
-    T = np.asarray(T, dtype=np.float64)
-    quat = R.from_matrix(T[:3, :3]).as_quat()  # (x, y, z, w), like c2w
-    return np.concatenate([T[:3, 3], quat]).astype(np.float64)
-
-
-def _interp_pose(T_start: np.ndarray, T_end: np.ndarray, w: float) -> np.ndarray:
-    """Interpolate two 4x4 poses: LERP translation, SLERP rotation. w in [0, 1]."""
-    T = np.eye(4)
-    T[:3, 3] = (1.0 - w) * T_start[:3, 3] + w * T_end[:3, 3]
-    key_rots = R.from_matrix(np.stack([T_start[:3, :3], T_end[:3, :3]]))
-    slerp = Slerp([0.0, 1.0], key_rots)
-    T[:3, :3] = slerp([w])[0].as_matrix()
-    return T
+# =============================================================================
+# Frame-level dataclasses
+# =============================================================================
 
 
 @dataclass
-class FrameData:
-    """Dataclass holding all synchronized data for a single frame."""
+class HandPose:
+    """A single hand's MANO fit for one frame.
 
-    timestamp_ns: int
+    All 3D quantities are metric and expressed in the **unrectified left-front
+    camera frame** (x right, y down, z forward). ``keypoints3d[0]`` is the
+    wrist and equals ``transl``.
+    """
+
+    side: str  # "left" | "right"
+    keypoints3d: np.ndarray  # (21, 3) float32, MANO-21 joints
+    vertices: np.ndarray  # (778, 3) float32, MANO mesh vertices
+    global_orient: np.ndarray  # (3, 3) float32, root rotation
+    transl: np.ndarray  # (3,) float32, root translation (== wrist)
+    hand_pose: np.ndarray  # (15, 3, 3) float32, articulated joint rotations
+    betas: np.ndarray  # (10,) float32, per-frame fitted MANO shape
+    source_view: str  # camera the fit was primarily sourced from, one of HAND_CAMS
+    inlier_mask: np.ndarray  # (4, 21) bool, per-view keypoint inliers; view axis == HAND_CAMS
+    is_detected: bool  # False when pose cleaning rejected this fit
+    reason: str  # cleaning rejection reason, "" when valid
+    hand_frame_idx: int  # frame the fit was sourced from (== frame_idx unless borrowed)
+
+
+@dataclass
+class HandFrameData:
+    """Dataclass holding all synchronized hand tracking data for a single frame.
+
+    RGB fields are ``None`` for cameras not in ``active_cameras``. Hand fields
+    are ``None`` when the tracker produced no fit for that hand on this frame
+    (the hand is absent from the npz), or - if the episode was constructed with
+    ``valid_only=True`` - when pose cleaning rejected the fit.
+    """
+
+    frame_idx: int
     left_front_rgb: Optional[np.ndarray]
     right_front_rgb: Optional[np.ndarray]
     left_eye_rgb: Optional[np.ndarray]
     right_eye_rgb: Optional[np.ndarray]
-    left_hand_kp: Optional[np.ndarray]
-    right_hand_kp: Optional[np.ndarray]
-    left_front_depth: Optional[np.ndarray]
-    left_eye_depth: Optional[np.ndarray]
-    c2w: Optional[np.ndarray]  # [tx, ty, tz, qx, qy, qz, qw]
-    left_wrist: Optional[np.ndarray]  # 7D [tx,ty,tz,qx,qy,qz,qw] in rect left-front frame, or None
-    right_wrist: Optional[np.ndarray]  # 7D [tx,ty,tz,qx,qy,qz,qw] in rect left-front frame, or None
-
-
-class LocalPathManager:
-    """Utility for resolving synchronized sub-paths for an episode."""
-
-    def __init__(self, rectified_dir: str):
-        self.rectified_dir = rectified_dir
-        hand_dir = posixpath.dirname(rectified_dir)
-        processed_dir = posixpath.dirname(hand_dir)
-
-        self.hand_pose_dir = posixpath.join(hand_dir, "hand_tracking", "poses", "refined", "params")
-        self.front_pcd_dir = posixpath.join(hand_dir, "compressed_pcds", "left-front")
-        self.eye_pcd_dir = posixpath.join(hand_dir, "compressed_pcds", "left-eye")
-        self.slam_trajectory_txt = posixpath.join(processed_dir, "slam", "mav0", "pycuvslam_trajectory.txt")
-        self.stereo_params_npz = posixpath.join(rectified_dir, "stereo_params.npz")
-        self.timestamp_txt = posixpath.join(rectified_dir, "timestamp.txt")
-
-
-class S3PathManager:
-    """Utility for resolving synchronized sub-paths for an episode."""
-
-    def __init__(self, rectified_dir: str):
-        self.rectified_dir = rectified_dir
-        hand_dir = posixpath.dirname(rectified_dir)
-        processed_dir = posixpath.dirname(hand_dir)
-
-        self.hand_pose_dir = posixpath.join(hand_dir, "hand_tracking", "poses", "refined", "params")
-        self.front_pcd_dir = posixpath.join(hand_dir, "compressed_pcds", "left-front")
-        self.eye_pcd_dir = posixpath.join(hand_dir, "compressed_pcds", "left-eye")
-        # NOTE: there was a format change so we need to support both - this is the fallback version
-        self.slam_trajectory_txt = [
-            posixpath.join(processed_dir, "slam", "mav0", "pycuvslam_trajectory.txt"),
-            posixpath.join(processed_dir, "slam", "pycuvslam_trajectory.txt"),
-        ]
-        self.stereo_params_npz = posixpath.join(rectified_dir, "stereo_params.npz")
-        self.timestamp_txt = posixpath.join(rectified_dir, "timestamp.txt")
+    left_hand: Optional[HandPose]
+    right_hand: Optional[HandPose]
 
 
 # =============================================================================
-# MP4 segment reader
+# Path management
 # =============================================================================
 
 
-class _PrefetchedS3Reader(io.RawIOBase):
-    """
-    Seekable file-like wrapper over an S3 object. Reads that fall inside a
-    pre-fetched range are served from memory; anything else issues an
-    on-demand range GET. PyAV / libavformat use this as the AVIOContext.
+class HandPathManager:
+    """Utility for resolving hand tracking v2 sub-paths for a session segment."""
 
-    With the moov prefix AND the keyframe-anchored data range both prefetched,
-    every read libav issues for normal MP4 parsing + decoding is served from
-    cache - so the entire decode is two HTTP GETs.
-    """
+    def __init__(self, session_dir: str, segment: int):
+        self.session_dir = str(Path(session_dir).expanduser())
+        self.segment = segment
+        self.segment_dir = os.path.join(self.session_dir, f"processed-segment{segment}")
 
-    def __init__(self, s3, bucket, key, size, prefetched):
-        self.s3 = s3
-        self.bucket = bucket
-        self.key = key
-        self.size = size
-        self.pos = 0
-        # list of (start, end, bytes) sorted by start
-        self._chunks = sorted((s, s + len(d), d) for s, d in prefetched)
+        self.hand_tracking_dir = os.path.join(self.segment_dir, "hand")
 
-    def _serve(self, start, end):
-        for cs, ce, data in self._chunks:
-            if cs <= start and end <= ce:
-                return data[start - cs : end - cs]
-        return None
+        self.params_dir = os.path.join(self.hand_tracking_dir, "pose_interpolation", "params")
+        self.save_dataset_dir = os.path.join(self.hand_tracking_dir, "save_dataset")
+        self.camera_params_npz = os.path.join(self.save_dataset_dir, "camera_params.npz")
+        self.continuous_intervals_json = os.path.join(self.save_dataset_dir, "continuous_intervals.json")
+        self.yield_json = os.path.join(self.save_dataset_dir, "yield.json")
+        self.pose_cleaning_json = os.path.join(self.hand_tracking_dir, "pose_cleaning", "metrics_pose_cleaning.json")
 
-    def readable(self):
-        return True
+    def param_file(self, frame_idx: int) -> str:
+        return os.path.join(self.params_dir, f"frame_{frame_idx:06d}.npz")
 
-    def writable(self):
+    def video_file(self, camera: str) -> str:
+        return os.path.join(self.save_dataset_dir, f"{camera}.mp4")
+
+
+class ClippedHandPathManager:
+    """Resolve a downloaded episode's flat hand lane without rebuilding a session tree."""
+
+    def __init__(self, lane_dir: Union[str, os.PathLike], params_dir: Union[str, os.PathLike], source_frame_start: int):
+        self.lane_dir = str(Path(lane_dir).expanduser().resolve())
+        self.segment_dir = self.lane_dir
+        self.hand_tracking_dir = self.lane_dir
+        self.save_dataset_dir = self.lane_dir
+        self.params_dir = str(Path(params_dir).expanduser().resolve())
+        self.source_frame_start = source_frame_start
+
+        self.camera_params_npz = os.path.join(self.lane_dir, "camera_params.npz")
+        self.continuous_intervals_json = os.path.join(self.lane_dir, "source_continuous_intervals.json")
+        self.yield_json = os.path.join(self.lane_dir, "source_yield.json")
+        # Pose-cleaning metrics are not part of the clipped-lane contract.
+        self.pose_cleaning_json = os.path.join(self.lane_dir, "source_pose_cleaning_metrics.json")
+
+    def param_file(self, frame_idx: int) -> str:
+        source_frame_idx = self.source_frame_start + frame_idx
+        return os.path.join(self.params_dir, f"frame_{source_frame_idx:06d}.npz")
+
+    def video_file(self, camera: str) -> str:
+        return os.path.join(self.lane_dir, f"{camera}.mp4")
+
+
+def _clipped_manifest_declarations(manifest: dict) -> tuple[List[str], List[str]]:
+    """Return supported camera files and flat source sidecars declared by a hand clip."""
+
+    videos = manifest.get("videos")
+    if not isinstance(videos, dict):
+        raise ValueError("Clipped hand manifest must publish a videos object")
+    declared_camera_files = [f"{camera}.mp4" for camera in HAND_CAMS if f"{camera}.mp4" in videos]
+
+    raw_sidecars = manifest.get("source_sidecars")
+    if not isinstance(raw_sidecars, list):
+        raise ValueError("Clipped hand manifest must publish a source_sidecars list")
+    declared_sidecars: List[str] = []
+    for value in raw_sidecars:
+        if not isinstance(value, str) or not value or value in {".", ".."}:
+            raise ValueError("Clipped hand source_sidecars entries must be non-empty filenames")
+        if "/" in value or "\\" in value or Path(value).name != value:
+            raise ValueError(f"Clipped hand source sidecar must be a flat filename: {value!r}")
+        if value in declared_sidecars:
+            raise ValueError(f"Clipped hand source sidecar is declared more than once: {value!r}")
+        declared_sidecars.append(value)
+    if "camera_params.npz" not in declared_sidecars:
+        raise ValueError("Clipped hand manifest must declare camera_params.npz as a source sidecar")
+    return declared_camera_files, declared_sidecars
+
+
+def _validate_hand_dir(paths: HandPathManager, active_cameras: List[str]) -> bool:
+    """Cheap structural validation of an extracted hand tracking segment."""
+    required = [
+        paths.params_dir,
+        paths.camera_params_npz,
+        paths.continuous_intervals_json,
+        paths.yield_json,
+    ]
+    required += [paths.video_file(cam) for cam in active_cameras]
+    if not all(os.path.exists(p) for p in required):
         return False
 
-    def seekable(self):
-        return True
-
-    def read(self, n=-1):
-        if n is None or n < 0:
-            n = self.size - self.pos
-        n = min(n, self.size - self.pos)
-        if n <= 0:
-            return b""
-        end = self.pos + n
-        cached = self._serve(self.pos, end)
-        if cached is not None:
-            self.pos = end
-            return cached
-        # Cache miss - serve from S3. Should be rare with proper prefetch.
-        resp = self.s3.get_object(
-            Bucket=self.bucket,
-            Key=self.key,
-            Range=f"bytes={self.pos}-{end - 1}",
-        )
-        data = resp["Body"].read()
-        self.pos += len(data)
-        return data
-
-    def readall(self):
-        return self.read(-1)
-
-    def readinto(self, b):
-        data = self.read(len(b))
-        n = len(data)
-        b[:n] = data
-        return n
-
-    def seek(self, offset, whence=0):
-        if whence == 0:
-            self.pos = offset
-        elif whence == 1:
-            self.pos += offset
-        elif whence == 2:
-            self.pos = self.size + offset
-        self.pos = max(0, min(self.pos, self.size))
-        return self.pos
-
-    def tell(self):
-        return self.pos
+    try:
+        with open(paths.yield_json, "r") as f:
+            total = int(json.load(f)["total_frames"])
+    except Exception:
+        return False
+    if total <= 0:
+        return False
+    # spot-check first/last per-frame files rather than all of them
+    return os.path.exists(paths.param_file(0)) and os.path.exists(paths.param_file(total - 1))
 
 
-class _Mp4SegmentExtractor:
+# =============================================================================
+# Download
+# =============================================================================
+
+
+def download_hand_segment(
+    session_uri: str,
+    segment: int,
+    target_dir: str = GROUNDED_DIR_DEFAULT,
+    aws_profile: Optional[str] = None,
+    tar_name: str = HAND_TAR_NAME_DEFAULT,
+    active_cameras: Optional[List[str]] = None,
+    keep_tar: bool = False,
+    verbose: bool = False,
+) -> str:
+    """Download + extract one segment's hand tracking tar from S3.
+
+    Thread-/process-safe via a per-(session, segment) file lock, mirroring the
+    v0.2.x CacheManager. Returns the **local session dir**, ready to be passed
+    to :class:`HandEpisode`. No-ops (fast) when a valid extraction already
+    exists.
+
+    Args:
+        session_uri: ``s3://bucket/.../{session}`` - the session folder on S3.
+            The tar is expected at ``{session_uri}/processed-segment{segment}/{tar_name}``.
+        segment: segment number within the session.
+        target_dir: local cache root; the S3 layout is mirrored beneath it.
+        aws_profile: optional AWS profile name.
+        tar_name: name of the tar object.
+        active_cameras: cameras whose mp4s must exist for validation
+            (defaults to all four).
+        keep_tar: keep the downloaded tar next to ``hand/`` after extraction.
+        verbose: print progress.
     """
-    Pulls a per-segment MP4 + sidecar from S3 and writes the frames for a
-    requested global-frame range to disk as frame_XXXXXX.jpg.
+    import boto3  # local import: only needed on the download path
+    import filelock
 
-    Strategy:
-      1. GET the small sidecar JSON.
-      2. Map global frame indices -> local (file-order) packet indices.
-      3. Find the keyframe at-or-before the start, and the next keyframe
-         at-or-after the end (or EOF) - this is the byte range we need.
-      4. Two range GETs: [0, init_bytes) for ftyp+moov+mdat header, and
-         [data_start, data_end) for the keyframe-anchored data.
-      5. Hand the result to PyAV via a seekable in-memory file-like and
-         decode just the frames we want.
-    """
+    active_cameras = active_cameras or list(HAND_CAMS)
 
-    def __init__(self, s3_client, bucket: str, segment_prefix: str, camera: str):
-        self.s3 = s3_client
-        self.bucket = bucket
-        self.mp4_key = posixpath.join(segment_prefix, f"{camera}.mp4")
-        self.sidecar_key = posixpath.join(segment_prefix, f"{camera}.idx.json")
-        self.camera = camera
-        self._sidecar = None
+    parsed = urlparse(session_uri)
+    if parsed.scheme != "s3":
+        raise ValueError(f"session_uri must be an s3:// URI, got: {session_uri}")
+    bucket = parsed.netloc
+    session_key = parsed.path.strip("/")
 
-    def exists(self) -> bool:
+    local_session_dir = str(Path(target_dir).expanduser() / bucket / session_key)
+    paths = HandPathManager(local_session_dir, segment)
+
+    locks_dir = Path(LOCKS_DIR_DEFAULT).expanduser()
+    os.makedirs(locks_dir, exist_ok=True)
+    lock_id = f"{session_key.replace('/', '_')}-segment{segment}-handv2"
+
+    with filelock.FileLock(str(locks_dir / f"{lock_id}.lock")):
+        if _validate_hand_dir(paths, active_cameras):
+            if verbose:
+                print(f"Hand segment already cached: {paths.segment_dir}")
+            return local_session_dir
+
+        os.makedirs(paths.segment_dir, exist_ok=True)
+        tar_key = posixpath.join(session_key, f"processed-segment{segment}", tar_name)
+        local_tar = os.path.join(paths.segment_dir, tar_name)
+
+        if not os.path.exists(local_tar):
+            if verbose:
+                print(f"Downloading s3://{bucket}/{tar_key} ...")
+            session = boto3.Session(profile_name=aws_profile)
+            s3_client = session.client("s3")
+            s3_client.download_file(bucket, tar_key, local_tar)
+
+        hand_dir = os.path.join(paths.segment_dir, "hand")
+        os.makedirs(hand_dir, exist_ok=True)
+        if verbose:
+            print(f"Extracting {local_tar} -> {hand_dir}")
+        with tarfile.open(local_tar) as tf:
+            try:
+                tf.extractall(hand_dir, filter="data")
+            except TypeError:  # `filter` kwarg requires >= 3.10.12 / 3.11.4
+                tf.extractall(hand_dir)
+
+        if not keep_tar:
+            os.remove(local_tar)
+
+        # re-resolve: `hand/hand_tracking` now exists
+        paths = HandPathManager(local_session_dir, segment)
+        if not _validate_hand_dir(paths, active_cameras):
+            raise ValueError(f"Extracted hand segment {paths.segment_dir} is missing required files.")
+
+    return local_session_dir
+
+
+def _sha256_path(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _clipped_pose_cache_valid(cache_dir: Path, archive_sha256: str, source_frame_start: int, source_frame_end: int) -> bool:
+    marker_path = cache_dir / "extraction.json"
+    params_dir = cache_dir.joinpath(*CLIPPED_POSE_PREFIX)
+    try:
+        marker = json.loads(marker_path.read_text())
+    except (OSError, ValueError, TypeError):
+        return False
+    if marker != {
+        "archive_sha256": archive_sha256,
+        "source_frame_start": source_frame_start,
+        "source_frame_end": source_frame_end,
+    }:
+        return False
+    expected_names = {f"frame_{index:06d}.npz" for index in range(source_frame_start, source_frame_end)}
+    try:
+        actual_names = {path.name for path in params_dir.iterdir() if path.is_file()}
+    except OSError:
+        return False
+    return actual_names == expected_names
+
+
+def _extract_clipped_pose_frames(
+    archive_path: Path,
+    *,
+    source_frame_start: int,
+    source_frame_end: int,
+) -> Path:
+    """Safely extract source-indexed pose files into an atomic, content-addressed cache."""
+
+    import filelock
+
+    if not archive_path.is_file():
+        raise FileNotFoundError(f"Missing clipped hand pose archive: {archive_path}")
+    if source_frame_start < 0 or source_frame_end <= source_frame_start:
+        raise ValueError(f"Invalid clipped pose range [{source_frame_start}, {source_frame_end})")
+
+    archive_sha256 = _sha256_path(archive_path)
+    extraction_root = archive_path.parent / ".grounded"
+    extraction_root.mkdir(parents=True, exist_ok=True)
+    # Keep components short enough for legacy Windows MAX_PATH environments;
+    # the marker still records and validates the full digest.
+    cache_dir = extraction_root / f"pose_frames-{archive_sha256[:16]}"
+    lock_path = extraction_root / f"pose_frames-{archive_sha256[:16]}.lock"
+
+    with filelock.FileLock(str(lock_path)):
+        if cache_dir.exists():
+            if _clipped_pose_cache_valid(cache_dir, archive_sha256, source_frame_start, source_frame_end):
+                return cache_dir.joinpath(*CLIPPED_POSE_PREFIX)
+            raise ValueError(
+                f"Clipped pose cache is incomplete or corrupt: {cache_dir}. "
+                "Remove only this content-addressed cache directory and reopen the episode."
+            )
+
+        temporary_dir = Path(tempfile.mkdtemp(prefix=f".pf-{archive_sha256[:8]}-", dir=extraction_root))
         try:
-            self.s3.head_object(Bucket=self.bucket, Key=self.mp4_key)
-            self.s3.head_object(Bucket=self.bucket, Key=self.sidecar_key)
-            return True
-        except botocore.exceptions.ClientError as e:
-            code = e.response["Error"]["Code"]
-            if code in ("404", "NoSuchKey", "NotFound"):
-                return False
-            raise
+            params_dir = temporary_dir.joinpath(*CLIPPED_POSE_PREFIX)
+            params_dir.mkdir(parents=True, exist_ok=True)
+            expected_indices = set(range(source_frame_start, source_frame_end))
+            extracted_indices: set[int] = set()
+
+            with tarfile.open(archive_path, mode="r:*") as archive:
+                for member in archive.getmembers():
+                    member_path = PurePosixPath(member.name)
+                    parts = member_path.parts
+                    if member_path.is_absolute() or not parts or any(part in {"", ".", ".."} for part in parts):
+                        raise ValueError(f"Unsafe path in clipped hand pose archive: {member.name!r}")
+                    if member.isdir():
+                        if tuple(parts) not in {
+                            CLIPPED_POSE_PREFIX[:1],
+                            CLIPPED_POSE_PREFIX[:2],
+                            CLIPPED_POSE_PREFIX,
+                        }:
+                            raise ValueError(f"Unexpected directory in clipped hand pose archive: {member.name!r}")
+                        continue
+                    if not member.isfile() or tuple(parts[:-1]) != CLIPPED_POSE_PREFIX:
+                        raise ValueError(f"Unexpected member in clipped hand pose archive: {member.name!r}")
+
+                    match = CLIPPED_POSE_FILENAME.fullmatch(parts[-1])
+                    if match is None:
+                        raise ValueError(f"Unexpected pose filename in clipped hand pose archive: {member.name!r}")
+                    source_frame_idx = int(match.group(1))
+                    if source_frame_idx not in expected_indices:
+                        raise ValueError(
+                            f"Pose frame {source_frame_idx} falls outside published range "
+                            f"[{source_frame_start}, {source_frame_end})"
+                        )
+                    if source_frame_idx in extracted_indices:
+                        raise ValueError(f"Duplicate pose frame in clipped hand pose archive: {source_frame_idx}")
+
+                    source = archive.extractfile(member)
+                    if source is None:
+                        raise ValueError(f"Could not read clipped hand pose archive member: {member.name!r}")
+                    destination = params_dir / parts[-1]
+                    with source, destination.open("xb") as output:
+                        shutil.copyfileobj(source, output)
+                    extracted_indices.add(source_frame_idx)
+
+            if extracted_indices != expected_indices:
+                missing = sorted(expected_indices - extracted_indices)
+                first_missing = missing[0] if missing else "unknown"
+                raise ValueError(
+                    f"Clipped hand pose archive has {len(extracted_indices)} frame(s), expected "
+                    f"{len(expected_indices)}; first missing source frame is {first_missing}"
+                )
+
+            marker = {
+                "archive_sha256": archive_sha256,
+                "source_frame_start": source_frame_start,
+                "source_frame_end": source_frame_end,
+            }
+            (temporary_dir / "extraction.json").write_text(json.dumps(marker, indent=2) + "\n")
+            os.replace(temporary_dir, cache_dir)
+            return cache_dir.joinpath(*CLIPPED_POSE_PREFIX)
+        finally:
+            if temporary_dir.exists():
+                shutil.rmtree(temporary_dir)
+
+
+def _full_hand_cache_valid(cache_dir: Path, archive_sha256: str, segment: int) -> bool:
+    marker_path = cache_dir / "extraction.json"
+    session_dir = cache_dir / "session"
+    try:
+        marker = json.loads(marker_path.read_text())
+    except (OSError, ValueError, TypeError):
+        return False
+    if marker != {
+        "archive_sha256": archive_sha256,
+        "segment": segment,
+    }:
+        return False
+    return _validate_hand_dir(HandPathManager(str(session_dir), segment), [])
+
+
+def _extract_full_hand_archive(
+    archive_path: Path,
+    *,
+    cache_root: Path,
+    segment: int,
+    active_cameras: List[str],
+) -> Path:
+    """Safely extract a full-segment Hand archive into an atomic content cache."""
+
+    import filelock
+
+    if not archive_path.is_file():
+        raise FileNotFoundError(f"Missing full hand archive: {archive_path}")
+    if segment < 0:
+        raise ValueError("segment must be non-negative")
+
+    archive_sha256 = _sha256_path(archive_path)
+    extraction_root = cache_root / ".grounded"
+    extraction_root.mkdir(parents=True, exist_ok=True)
+    cache_dir = extraction_root / f"hand-{archive_sha256[:16]}-segment{segment}"
+    lock_path = extraction_root / f"hand-{archive_sha256[:16]}-segment{segment}.lock"
+
+    with filelock.FileLock(str(lock_path)):
+        if cache_dir.exists():
+            if not _full_hand_cache_valid(cache_dir, archive_sha256, segment):
+                raise ValueError(
+                    f"Full hand cache is incomplete or corrupt: {cache_dir}. "
+                    "Remove only this content-addressed cache directory and reopen the asset."
+                )
+            session_dir = cache_dir / "session"
+            if not _validate_hand_dir(HandPathManager(str(session_dir), segment), active_cameras):
+                raise ValueError("Full hand archive is missing one or more requested camera videos")
+            return session_dir
+
+        temporary_dir = Path(tempfile.mkdtemp(prefix=f".hand-{archive_sha256[:8]}-", dir=extraction_root))
+        try:
+            session_dir = temporary_dir / "session"
+            segment_dir = session_dir / f"processed-segment{segment}"
+            hand_dir = segment_dir / "hand"
+            hand_dir.mkdir(parents=True, exist_ok=True)
+            extracted_files: set[Path] = set()
+
+            with tarfile.open(archive_path, mode="r:*") as archive:
+                normalized_members: list[tuple[tarfile.TarInfo, tuple[str, ...]]] = []
+                for member in archive.getmembers():
+                    if "\\" in member.name:
+                        raise ValueError(f"Unsafe path in full hand archive: {member.name!r}")
+                    member_path = PurePosixPath(member.name)
+                    parts = tuple(part for part in member_path.parts if part not in {"", "."})
+                    if not parts and member.isdir():
+                        continue
+                    if member_path.is_absolute() or not parts or any(part == ".." or ":" in part for part in parts):
+                        raise ValueError(f"Unsafe path in full hand archive: {member.name!r}")
+                    normalized_members.append((member, parts))
+
+                has_hand_prefix = [parts[0] == "hand" for _, parts in normalized_members]
+                if any(has_hand_prefix) and not all(has_hand_prefix):
+                    raise ValueError("Full hand archive mixes hand-prefixed and rootless paths")
+                destination_root = segment_dir if has_hand_prefix and all(has_hand_prefix) else hand_dir
+                resolved_destination_root = destination_root.resolve()
+
+                for member, parts in normalized_members:
+                    destination = destination_root.joinpath(*parts).resolve()
+                    if destination != resolved_destination_root and resolved_destination_root not in destination.parents:
+                        raise ValueError(f"Unsafe path in full hand archive: {member.name!r}")
+                    if member.isdir():
+                        destination.mkdir(parents=True, exist_ok=True)
+                        continue
+                    if not member.isfile():
+                        raise ValueError(f"Unsupported member in full hand archive: {member.name!r}")
+                    if destination in extracted_files:
+                        raise ValueError(f"Duplicate file in full hand archive: {member.name!r}")
+
+                    source = archive.extractfile(member)
+                    if source is None:
+                        raise ValueError(f"Could not read full hand archive member: {member.name!r}")
+                    destination.parent.mkdir(parents=True, exist_ok=True)
+                    with source, destination.open("xb") as output:
+                        shutil.copyfileobj(source, output)
+                    extracted_files.add(destination)
+
+            paths = HandPathManager(str(session_dir), segment)
+            if not _validate_hand_dir(paths, active_cameras):
+                raise ValueError("Full hand archive is missing required Hand files or requested camera videos")
+            marker = {
+                "archive_sha256": archive_sha256,
+                "segment": segment,
+            }
+            (temporary_dir / "extraction.json").write_text(json.dumps(marker, indent=2) + "\n")
+            os.replace(temporary_dir, cache_dir)
+            return cache_dir / "session"
+        finally:
+            if temporary_dir.exists():
+                shutil.rmtree(temporary_dir)
+
+
+# =============================================================================
+# Sequential-friendly video reader
+# =============================================================================
+
+
+class _VideoReader:
+    """cv2.VideoCapture wrapper that only seeks when access is non-sequential.
+
+    Iterating an episode front-to-back (the common rendering pattern) therefore
+    never seeks; random access falls back to CAP_PROP_POS_FRAMES.
+    """
+
+    def __init__(self, path: str):
+        if not os.path.exists(path):
+            raise FileNotFoundError(f"Missing video: {path}")
+        self.path = path
+        self.cap = cv2.VideoCapture(path)
+        if not self.cap.isOpened():
+            raise IOError(f"Failed to open video: {path}")
+        self.next_idx = 0
 
     @property
-    def sidecar(self) -> dict:
-        if self._sidecar is None:
-            body = self.s3.get_object(Bucket=self.bucket, Key=self.sidecar_key)["Body"].read()
-            self._sidecar = json.loads(body)
-        return self._sidecar
+    def fps(self) -> float:
+        return float(self.cap.get(cv2.CAP_PROP_FPS))
 
-    def extract_range(self, frame_start: int, frame_end: int, out_dir: str):
-        """Decode global frames [frame_start, frame_end) and write JPGs into out_dir."""
-        import av  # local import: only needed when MP4-backed segments are read
+    @property
+    def num_frames(self) -> int:
+        return int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT))
 
-        os.makedirs(out_dir, exist_ok=True)
-        side = self.sidecar
-        first_gf = side["first_global_frame"]
-        contiguous = side.get("contiguous", True)
-        offsets = side["offsets"]
-        sizes = side["sizes"]
-        kfs = side["keyframe_indices"]
-        fps = side["fps"]
-        file_size = side["file_size"]
-        init_bytes = side["init_bytes"]
+    def read_rgb(self, frame_idx: int) -> np.ndarray:
+        if frame_idx != self.next_idx:
+            self.cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+        ok, bgr = self.cap.read()
+        if not ok or bgr is None:
+            raise IOError(f"Failed to decode frame {frame_idx} from {self.path}")
+        self.next_idx = frame_idx + 1
+        return cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
 
-        # Map global -> local (file/decode-order) packet indices.
-        # In a closed-GOP MP4, all packets of GOP K occupy file positions
-        # [K*GOP, (K+1)*GOP), independent of internal B-frame reordering, so
-        # this packet-index space is the right thing to byte-range against.
-        if contiguous:
-            local_start = frame_start - first_gf
-            local_end = frame_end - first_gf
-
-            def local_to_global(i):
-                return first_gf + i
-        else:
-            gfi = side["global_frame_indices"]
-            local_start = gfi.index(frame_start)
-            local_end = gfi.index(frame_end - 1) + 1
-
-            def local_to_global(i):
-                return gfi[i]
-
-        # Sanity-check the request against the actual MP4 length. The two
-        # common ways this trips:
-        #   - The index says frame_start=X (a JPG-derived global frame
-        #     number), but the sidecar was authored for a legacy MP4
-        #     segment where first_global_frame=0. local_start ends up far
-        #     past the MP4's actual length.
-        #   - The index references frames the segment never had (range
-        #     misaligned).
-        # Without this check, we'd silently read past the end of `offsets`
-        # and produce no output, which surfaces downstream as a less
-        # informative FileNotFoundError on the missing JPG cache files.
-        n_frames_in_mp4 = len(offsets)
-        if local_start < 0 or local_start >= n_frames_in_mp4:
-            sidecar_source = side.get("source", "unknown")
-            raise IndexError(
-                f"Requested global frames [{frame_start}, {frame_end}) "
-                f"don't map into this MP4. Sidecar first_global_frame="
-                f"{first_gf}, num_frames={n_frames_in_mp4}, source="
-                f"{sidecar_source}. Computed local_start={local_start} "
-                f"is out of bounds [0, {n_frames_in_mp4}). This usually "
-                f"means the index.json's frame numbering doesn't match "
-                f"the sidecar's - e.g. an episode whose frame_start is a "
-                f"JPG-derived global index but whose segment is a legacy "
-                f"MP4 with first_global_frame=0."
-            )
-
-        # Clamp to valid range.
-        local_start = max(0, local_start)
-        local_end = min(len(offsets), local_end)
-        if local_end <= local_start:
-            return
-
-        # Find byte range covering all packets needed to decode [local_start, local_end):
-        #   start = keyframe at-or-before local_start
-        #   end   = either the next keyframe after local_end-1, or EOF
-        kf_idx = max(0, bisect.bisect_right(kfs, local_start) - 1)
-        kf_start = kfs[kf_idx]
-        next_kf_idx = bisect.bisect_right(kfs, local_end - 1)
-        last_packet = (kfs[next_kf_idx] - 1) if next_kf_idx < len(kfs) else (len(offsets) - 1)
-
-        data_start = offsets[kf_start]
-        data_end = offsets[last_packet] + sizes[last_packet]
-
-        # Two range GETs - the bulk of the egress savings happens here.
-        init_data = self.s3.get_object(
-            Bucket=self.bucket,
-            Key=self.mp4_key,
-            Range=f"bytes=0-{init_bytes - 1}",
-        )["Body"].read()
-        data_chunk = self.s3.get_object(
-            Bucket=self.bucket,
-            Key=self.mp4_key,
-            Range=f"bytes={data_start}-{data_end - 1}",
-        )["Body"].read()
-
-        reader = _PrefetchedS3Reader(
-            self.s3,
-            self.bucket,
-            self.mp4_key,
-            file_size,
-            prefetched=[(0, init_data), (data_start, data_chunk)],
-        )
-
-        with av.open(reader, mode="r") as container:
-            stream = container.streams.video[0]
-            stream.thread_type = "AUTO"
-
-            # Seek to the keyframe (pts in stream.time_base units). backward=True
-            # ensures we land on a keyframe at-or-before the target.
-            time_base = float(stream.time_base)
-            target_pts = int(round(kf_start / fps / time_base))
-            container.seek(target_pts, stream=stream, any_frame=False, backward=True)
-
-            # decode() yields VideoFrames in display order. We filter to the
-            # requested range and write each to disk as JPG.
-            for frame in container.decode(stream):
-                if frame.pts is None:
-                    continue
-                local_idx = int(round(float(frame.pts) * time_base * fps))
-                if local_idx < local_start:
-                    continue
-                if local_idx >= local_end:
-                    break
-
-                global_idx = local_to_global(local_idx)
-                bgr = frame.to_ndarray(format="bgr24")
-                out_path = os.path.join(out_dir, f"frame_{global_idx:06d}.jpg")
-                cv2.imwrite(out_path, bgr, [cv2.IMWRITE_JPEG_QUALITY, JPG_QUALITY_ON_WRITE])
+    def release(self):
+        if self.cap is not None:
+            self.cap.release()
+            self.cap = None
 
 
 # =============================================================================
-# Cache manager
+# Episode
 # =============================================================================
 
 
-class CacheManager:
-    """Handles thread-safe downloading, caching, and merging of episode data."""
+class HandEpisode(Dataset):
+    """A pure data-reading representation of one segment's hand tracking outputs.
+
+    Frames index the **entire recording** of the segment (``[0, total_frames)``
+    by default); pass ``start_frame``/``end_frame`` to restrict to a
+    sub-interval (e.g. one of ``episode.continuous_intervals``).
+
+    Notes:
+        - All hand geometry is in the unrectified left-front camera frame.
+          Use ``episode.camera_params["K_{cam}"]`` and
+          ``episode.camera_params["T_{cam}_from_left_front"]`` to project into
+          any of the four (undistorted-pinhole) video streams.
+        - Video handles are opened lazily per camera and are not shareable
+          across processes; with a multi-worker DataLoader each worker opens
+          its own handles on first access.
+    """
 
     def __init__(
         self,
-        target_dir: str = GROUNDED_DIR_DEFAULT,
-        aws_profile: Optional[str] = None,
-        active_cameras: List[str] = None,
-        verbose: bool = False,
+        session_dir: str,
+        segment: int = 0,
+        active_cameras: Optional[List[str]] = None,
+        start_frame: int = 0,
+        end_frame: Optional[int] = None,
+        valid_only: bool = False,
     ):
-        self.target_dir = Path(target_dir).expanduser()
-        self.aws_profile = aws_profile
-        self.active_cameras = active_cameras or ["left-front", "right-front"]
-        self.locks_dir = Path(LOCKS_DIR_DEFAULT).expanduser()
-        self.verbose = verbose
+        self.session_dir = str(Path(session_dir).expanduser())
+        self.segment = segment
+        self.path_manager = HandPathManager(self.session_dir, segment)
+        self.active_cameras = list(active_cameras) if active_cameras is not None else []
+        assert set(self.active_cameras).issubset(set(HAND_CAMS)), f"active_cameras must be a subset of {HAND_CAMS}"
+        self.valid_only = valid_only
 
-        os.makedirs(self.target_dir, exist_ok=True)
-        os.makedirs(self.locks_dir, exist_ok=True)
-
-    def download_episode(self, episode_info: dict, episode_uri: str, s3_concurrency: int = 64) -> str:
-        """
-        Thread-safe entry point. Locks the episode ID so multiple PyTorch workers
-        don't collide while downloading or interpolating the same episode.
-        """
-        frame_start = episode_info["frame_start"]
-        frame_end = episode_info["frame_end"]
-        device_id = episode_info["device_id"]
-        session_num = episode_info["session_num"]
-        segment_num = episode_info["segment_num"]
-        episode_id = f"{device_id}-{session_num}-{segment_num}-{frame_start}-{frame_end}"
-
-        local_rectified_data_dir = self._get_local_path(episode_info, episode_uri)
-        local_paths = LocalPathManager(local_rectified_data_dir)
-
-        if episode_uri.startswith("s3://"):
-            lock_path = self.locks_dir / f"{episode_id}.lock"
-
-            with filelock.FileLock(str(lock_path)):
-                if self._validate_episode_dir(local_paths, frame_start, frame_end):
-                    return local_rectified_data_dir
-
-                self._download_and_sync(episode_info, episode_uri, local_paths, s3_concurrency, episode_id)
-                self._merge_hand_streams(local_paths, frame_start, frame_end)
-
-                if not self._validate_episode_dir(local_paths, frame_start, frame_end):
-                    raise ValueError(
-                        f"Downloaded episode {local_rectified_data_dir} is missing required files post-processing."
-                    )
-
-        return local_rectified_data_dir
-
-    def _get_local_path(self, episode_info: dict, episode_uri: str) -> str:
-        if episode_uri.startswith("s3://"):
-            parsed = urlparse(episode_uri)
-            s3_rectified_key = posixpath.dirname(parsed.path.lstrip("/"))
-            return str(self.target_dir / parsed.netloc / s3_rectified_key)
-        else:
-            rel_path = os.path.join(
-                f"{episode_info['device_id']}_session_{episode_info['session_num']}",
-                f"processed-segment{episode_info['segment_num']}",
-                "hand",
-                "rectified_dataset",
-            )
-            return os.path.join(self.target_dir, "local_sync", rel_path)
-
-    # ---- the main change: split camera downloads (MP4) from everything else --
-
-    def _download_and_sync(
-        self,
-        episode_info: dict,
-        episode_uri: str,
-        local_paths: LocalPathManager,
-        s3_concurrency: int,
-        episode_id: str,
-    ):
-        frame_start = episode_info["frame_start"]
-        frame_end = episode_info["frame_end"]
-
-        os.makedirs(local_paths.hand_pose_dir, exist_ok=True)
-        os.makedirs(local_paths.front_pcd_dir, exist_ok=True)
-        os.makedirs(local_paths.eye_pcd_dir, exist_ok=True)
-        for cam in self.active_cameras:
-            os.makedirs(os.path.join(local_paths.rectified_dir, cam), exist_ok=True)
-
-        parsed = urlparse(episode_uri)
-        bucket_name = parsed.netloc
-        s3_base_prefix = posixpath.dirname(parsed.path.lstrip("/"))
-
-        config = botocore.config.Config(max_pool_connections=s3_concurrency)
-        session = boto3.Session(profile_name=self.aws_profile)
-        s3_client = session.client("s3", config=config)
-
-        def _sync_file(src: Union[str, List[str]], dst: str):
-            if os.path.exists(dst):
-                return
-            sources = src if isinstance(src, list) else [src]
-            os.makedirs(os.path.dirname(dst), exist_ok=True)
-            for s in sources:
-                p = urlparse(s)
-                try:
-                    s3_client.download_file(p.netloc, p.path.lstrip("/"), dst)
-                    return
-                except botocore.exceptions.ClientError:
-                    continue
-
-        src_paths = S3PathManager(f"s3://{bucket_name}/{s3_base_prefix}")
-
-        # --- Non-camera files: timestamps, params, slam, hand poses, point clouds.
-        # All small per-frame npz files still come down individually for now.
-        non_camera_tasks = [
-            (src_paths.timestamp_txt, local_paths.timestamp_txt),
-            (src_paths.stereo_params_npz, local_paths.stereo_params_npz),
-            (src_paths.slam_trajectory_txt, local_paths.slam_trajectory_txt),
-        ]
-        for frame_idx in range(frame_start, frame_end):
-            npz_filename = f"frame_{frame_idx:06d}.npz"
-            non_camera_tasks.append(
-                (
-                    posixpath.join(src_paths.hand_pose_dir, npz_filename),
-                    os.path.join(local_paths.hand_pose_dir, npz_filename),
-                )
-            )
-            non_camera_tasks.append(
-                (
-                    posixpath.join(src_paths.front_pcd_dir, npz_filename),
-                    os.path.join(local_paths.front_pcd_dir, npz_filename),
-                )
-            )
-            non_camera_tasks.append(
-                (
-                    posixpath.join(src_paths.eye_pcd_dir, npz_filename),
-                    os.path.join(local_paths.eye_pcd_dir, npz_filename),
-                )
+        if not os.path.isdir(self.path_manager.hand_tracking_dir):
+            raise FileNotFoundError(
+                f"No hand tracking outputs under {self.path_manager.segment_dir}. "
+                f"Expected {self.path_manager.hand_tracking_dir}. "
+                f"Download/extract the segment first (see download_hand_segment)."
             )
 
-        with ThreadPoolExecutor(max_workers=s3_concurrency) as executor:
-            futures = [executor.submit(_sync_file, src, dst) for src, dst in non_camera_tasks]
-            for future in tqdm(
-                as_completed(futures),
-                total=len(futures),
-                desc=f"Downloading {episode_id} (metadata)",
-                leave=False,
-                disable=not self.verbose,
-            ):
-                try:
-                    future.result()
-                except Exception as e:
-                    print(f"Failed to sync a file: {e}")
+        cam_npz = np.load(self.path_manager.camera_params_npz, allow_pickle=True)
+        self.camera_params: Dict[str, np.ndarray] = {key: cam_npz[key] for key in cam_npz.files}
 
-        # Camera frames: every segment must have a converted MP4 + sidecar.
-        # If anything's missing or extraction fails, this is a hard error -
-        # there's no per-JPG fallback after the conversion was finalized.
-        for cam in self.active_cameras:
-            cam_dir = os.path.join(local_paths.rectified_dir, cam)
-            if self._cam_dir_already_populated(cam_dir, frame_start, frame_end):
-                continue
+        with open(self.path_manager.yield_json, "r") as f:
+            self.yield_stats: dict = json.load(f)
+        self.total_frames: int = int(self.yield_stats["total_frames"])
 
-            extractor = _Mp4SegmentExtractor(s3_client, bucket_name, s3_base_prefix, cam)
-            if not extractor.exists():
-                raise RuntimeError(
-                    f"No converted MP4+sidecar found for {cam} on "
-                    f"{episode_id}. Expected "
-                    f"s3://{bucket_name}/{s3_base_prefix}/{cam}.mp4 and "
-                    f"s3://{bucket_name}/{s3_base_prefix}/{cam}.idx.json. "
-                    f"If this segment was supposed to be converted, "
-                    f"investigate the conversion pipeline; if it's not in "
-                    f"the converted set, filter it out of index.json."
-                )
-            try:
-                extractor.extract_range(frame_start, frame_end, cam_dir)
-            except Exception as e:
-                raise RuntimeError(f"MP4 extraction failed for {cam} on {episode_id}: {e!r}")
+        with open(self.path_manager.continuous_intervals_json, "r") as f:
+            intervals_raw = json.load(f)
+        # inclusive [start, end] runs where both hands are valid
+        self.continuous_intervals: List[dict] = intervals_raw.get("both_intervals", [])
 
-        if self.verbose:
-            print(f"Finished downloading {episode_id}.")
-
-    @staticmethod
-    def _cam_dir_already_populated(cam_dir: str, frame_start: int, frame_end: int) -> bool:
-        if not os.path.isdir(cam_dir):
-            return False
-        for i in range(frame_start, frame_end):
-            if not os.path.exists(os.path.join(cam_dir, f"frame_{i:06d}.jpg")):
-                return False
-        return True
-
-    # ---- everything below is unchanged from the original SDK ------------------
-
-    def _merge_hand_streams(self, path_manager: LocalPathManager, frame_start: int, frame_end: int):
-        """
-        Phase 1: Project missing front detections from the eye cameras and save to disk.
-        Phase 2: Group remaining complete gaps and fill them using Linear Interpolation (LERP).
-        """
-        stereo_npz = np.load(path_manager.stereo_params_npz, allow_pickle=True)
-        T_f2e_unrect = stereo_npz["T_front_to_eye"]
-
-        R_eye_4x4 = np.eye(4)
-        R_eye_4x4[:3, :3] = stereo_npz["eye_R1"]
-        R_eye_inv = np.linalg.inv(R_eye_4x4)
-
-        T_e2f_unrect = np.linalg.inv(T_f2e_unrect)
-
-        R_front_4x4 = np.eye(4)
-        R_front_4x4[:3, :3] = stereo_npz["front_R1"]
-
-        T_recteye_to_rectfront = R_front_4x4 @ T_e2f_unrect @ R_eye_inv
-
-        def is_missing(kp):
-            return kp is None or np.size(kp) == 0 or np.all(kp == 0)
-
-        def project_eye_to_front(kp_eye):
-            if is_missing(kp_eye) or T_recteye_to_rectfront is None:
-                return None
-            ones = np.ones((kp_eye.shape[0], 1), dtype=kp_eye.dtype)
-            kp_eye_h = np.concatenate([kp_eye, ones], axis=-1)
-            return (T_recteye_to_rectfront @ kp_eye_h.T).T[:, :3]
-
-        missing_left = []
-        missing_right = []
-
-        for i in range(frame_start, frame_end):
-            filepath = os.path.join(path_manager.hand_pose_dir, f"frame_{i:06d}.npz")
-            if not os.path.exists(filepath):
-                missing_left.append(i)
-                missing_right.append(i)
-                continue
-
-            try:
-                with np.load(filepath, allow_pickle=True) as d:
-                    left_data = d["left"].item()
-                    right_data = d["right"].item()
-            except Exception:
-                missing_left.append(i)
-                missing_right.append(i)
-                continue
-
-            l_front = (left_data.get("front") or {}).get("keypoints_3d_rectcam")
-            r_front = (right_data.get("front") or {}).get("keypoints_3d_rectcam")
-
-            needs_save = False
-
-            if is_missing(l_front):
-                l_eye = (left_data.get("eye") or {}).get("keypoints_3d_rectcam")
-                l_front = project_eye_to_front(l_eye)
-                if not is_missing(l_front):
-                    needs_save = True
-
-            if is_missing(r_front):
-                r_eye = (right_data.get("eye") or {}).get("keypoints_3d_rectcam")
-                r_front = project_eye_to_front(r_eye)
-                if not is_missing(r_front):
-                    needs_save = True
-
-            if needs_save:
-                out_left = left_data.copy()
-                out_right = right_data.copy()
-
-                if not is_missing(l_front):
-                    out_left.setdefault("front", {})["keypoints_3d_rectcam"] = l_front
-                if not is_missing(r_front):
-                    out_right.setdefault("front", {})["keypoints_3d_rectcam"] = r_front
-
-                np.savez(filepath, left=np.array(out_left), right=np.array(out_right))
-
-            if is_missing(l_front):
-                missing_left.append(i)
-            if is_missing(r_front):
-                missing_right.append(i)
-
-        if not missing_left and not missing_right:
-            return
-
-        def _load_front_only(frame_idx: int):
-            filepath = os.path.join(path_manager.hand_pose_dir, f"frame_{frame_idx:06d}.npz")
-            if not os.path.exists(filepath):
-                return None, None
-            try:
-                with np.load(filepath, allow_pickle=True) as d:
-                    l = (d["left"].item().get("front") or {}).get("keypoints_3d_rectcam")
-                    r = (d["right"].item().get("front") or {}).get("keypoints_3d_rectcam")
-                    return l if not is_missing(l) else None, r if not is_missing(r) else None
-            except:
-                return None, None
-
-        def _group_gaps(indices):
-            if not indices:
-                return []
-            gaps, current = [], [indices[0]]
-            for i in range(1, len(indices)):
-                if indices[i] == indices[i - 1] + 1:
-                    current.append(indices[i])
-                else:
-                    gaps.append(current)
-                    current = [indices[i]]
-            gaps.append(current)
-            return gaps
-
-        def _process_hand_gaps(gaps, is_left: bool):
-            for gap in gaps:
-                start_valid = gap[0] - 1
-                start_kp = None
-                while start_valid >= 0:
-                    l, r = _load_front_only(start_valid)
-                    start_kp = l if is_left else r
-                    if start_kp is not None:
-                        break
-                    start_valid -= 1
-
-                end_valid = gap[-1] + 1
-                end_kp = None
-                while end_valid < frame_end + 10000:
-                    l, r = _load_front_only(end_valid)
-                    end_kp = l if is_left else r
-                    if end_kp is not None:
-                        break
-                    end_valid += 1
-
-                if start_kp is None or end_kp is None:
-                    continue
-
-                for i in gap:
-                    w = (i - start_valid) / (end_valid - start_valid)
-                    interp_kp = start_kp + w * (end_kp - start_kp)
-
-                    filepath = os.path.join(path_manager.hand_pose_dir, f"frame_{i:06d}.npz")
-
-                    out_left, out_right = {}, {}
-                    if os.path.exists(filepath):
-                        with np.load(filepath, allow_pickle=True) as d:
-                            out_left = d["left"].item()
-                            out_right = d["right"].item()
-
-                    if is_left:
-                        out_left.setdefault("front", {})["keypoints_3d_rectcam"] = interp_kp
-                    else:
-                        out_right.setdefault("front", {})["keypoints_3d_rectcam"] = interp_kp
-
-                    np.savez(filepath, left=np.array(out_left), right=np.array(out_right))
-
-        _process_hand_gaps(_group_gaps(missing_left), is_left=True)
-        _process_hand_gaps(_group_gaps(missing_right), is_left=False)
-
-        # Independent of the keypoint stream above: build and gap-fill the wrist-pose
-        # stream (translation LERP + rotation Slerp), gated by MAX_POSE_GAP_FRAMES.
-        self._merge_wrist_poses(path_manager, frame_start, frame_end)
-
-    # Largest gap (in frames) we will Slerp-fill for wrist poses. Longer gaps are
-    # left missing rather than risk a large-rotation interpolation error.
-    MAX_POSE_GAP_FRAMES = 15
-
-    def _merge_wrist_poses(self, path_manager: "LocalPathManager", frame_start: int, frame_end: int):
-        """Fill missing wrist poses independently of the 21-keypoint interpolation.
-
-        For each hand, reads the stored fitted root pose per frame, finds runs of
-        missing frames, and fills runs no longer than MAX_POSE_GAP_FRAMES by
-        interpolating the bracketing valid poses (LERP translation, SLERP rotation).
-        Filled poses are written under the 'wrist_pose_rectcam' key, never touching
-        'keypoints_3d_rectcam'.
-        """
-
-        def _load_pose(frame_idx: int, hand: str) -> Optional[np.ndarray]:
-            fp = os.path.join(path_manager.hand_pose_dir, f"frame_{frame_idx:06d}.npz")
-            if not os.path.exists(fp):
-                return None
-            try:
-                with np.load(fp, allow_pickle=True) as d:
-                    hand_dict = d[hand].item()
-            except Exception:
-                return None
-            # Prefer an already-materialized wrist pose (cached in the front view by a
-            # previous pass), else parse the fitted root pose from the top-level dict.
-            cached = (hand_dict.get("front") or {}).get("wrist_pose_rectcam")
-            if cached is not None:
-                T = np.asarray(cached, dtype=np.float64)
-                return None if _pose_is_missing(T) else T
-            T = _parse_wrist_pose_from_hand(hand_dict)
-            return None if _pose_is_missing(T) else T
-
-        def _write_pose(frame_idx: int, hand: str, T: np.ndarray):
-            fp = os.path.join(path_manager.hand_pose_dir, f"frame_{frame_idx:06d}.npz")
-            out_left, out_right = {}, {}
-            if os.path.exists(fp):
-                with np.load(fp, allow_pickle=True) as d:
-                    out_left = d["left"].item()
-                    out_right = d["right"].item()
-            target = out_left if hand == "left" else out_right
-            target.setdefault("front", {})["wrist_pose_rectcam"] = T.astype(np.float32)
-            np.savez(fp, left=np.array(out_left), right=np.array(out_right))
-
-        def _group_gaps(indices):
-            if not indices:
-                return []
-            gaps, current = [], [indices[0]]
-            for k in range(1, len(indices)):
-                if indices[k] == indices[k - 1] + 1:
-                    current.append(indices[k])
-                else:
-                    gaps.append(current)
-                    current = [indices[k]]
-            gaps.append(current)
-            return gaps
-
-        for hand in ("left", "right"):
-            # First materialize any natively-available pose so reads are stable,
-            # and record which frames are missing a pose.
-            missing = []
-            for i in range(frame_start, frame_end):
-                T = _load_pose(i, hand)
-                if T is None:
-                    missing.append(i)
-                else:
-                    # persist parsed-from-params pose under the canonical key (idempotent)
-                    _write_pose(i, hand, T)
-
-            for gap in _group_gaps(missing):
-                if len(gap) > self.MAX_POSE_GAP_FRAMES:
-                    continue  # too long; leave missing
-
-                start_valid = gap[0] - 1
-                T_start = None
-                while start_valid >= frame_start:
-                    T_start = _load_pose(start_valid, hand)
-                    if T_start is not None:
-                        break
-                    start_valid -= 1
-
-                end_valid = gap[-1] + 1
-                T_end = None
-                while end_valid < frame_end:
-                    T_end = _load_pose(end_valid, hand)
-                    if T_end is not None:
-                        break
-                    end_valid += 1
-
-                # Need both brackets to interpolate (no extrapolation at episode edges).
-                if T_start is None or T_end is None:
-                    continue
-
-                span = end_valid - start_valid
-                for i in gap:
-                    w = (i - start_valid) / span
-                    _write_pose(i, hand, _interp_pose(T_start, T_end, w))
-
-    def _validate_episode_dir(self, path_manager: LocalPathManager, frame_start: int, frame_end: int) -> bool:
-        required = [
-            path_manager.timestamp_txt,
-            path_manager.stereo_params_npz,
-            path_manager.slam_trajectory_txt,
-            path_manager.hand_pose_dir,
-            path_manager.front_pcd_dir,
-            path_manager.eye_pcd_dir,
-        ]
-        for cam in self.active_cameras:
-            required.append(os.path.join(path_manager.rectified_dir, cam))
-
-        for p in required:
-            if not os.path.exists(p):
-                return False
-
-        if frame_end > frame_start:
-            for i in (frame_start, frame_end - 1):
-                if not os.path.exists(os.path.join(path_manager.hand_pose_dir, f"frame_{i:06d}.npz")):
-                    return False
-                if not os.path.exists(os.path.join(path_manager.front_pcd_dir, f"frame_{i:06d}.npz")):
-                    return False
-                if not os.path.exists(os.path.join(path_manager.eye_pcd_dir, f"frame_{i:06d}.npz")):
-                    return False
-                for cam in self.active_cameras:
-                    if not os.path.exists(os.path.join(path_manager.rectified_dir, cam, f"frame_{i:06d}.jpg")):
-                        return False
-
-        return True
-
-    # ---- local-cache cleanup --------------------------------------------------
-
-    def delete_episode(self, episode_info: dict, episode_uri: str, purge_segment: bool = False) -> int:
-        """Delete an episode's cached files to free disk. The cache is
-        per-segment, so by default only this episode's frame_*.{jpg,npz} in
-        [frame_start, frame_end) are removed; purge_segment=True drops the
-        whole segment dir (also wiping sibling episodes). Returns file count
-        removed. Locks the episode so it won't race its own download."""
-        fs, fe = episode_info["frame_start"], episode_info["frame_end"]
-        rect_dir = self._get_local_path(episode_info, episode_uri)
-        if not os.path.exists(rect_dir):
-            return 0
-        lp = LocalPathManager(rect_dir)
-
-        def _delete() -> int:
-            if purge_segment:
-                dirs = [lp.rectified_dir, lp.hand_pose_dir, lp.front_pcd_dir, lp.eye_pcd_dir]
-                n = sum(len(files) for d in dirs if os.path.isdir(d) for _, _, files in os.walk(d))
-                for d in dirs:
-                    shutil.rmtree(d, ignore_errors=True)
-                return n
-            cam_dirs = (
-                [
-                    os.path.join(lp.rectified_dir, e)
-                    for e in os.listdir(lp.rectified_dir)
-                    if os.path.isdir(os.path.join(lp.rectified_dir, e))
-                ]
-                if os.path.isdir(lp.rectified_dir)
-                else []
-            )
-            removed = 0
-            for i in range(fs, fe):
-                npz, jpg = f"frame_{i:06d}.npz", f"frame_{i:06d}.jpg"
-                paths = [
-                    os.path.join(lp.hand_pose_dir, npz),
-                    os.path.join(lp.front_pcd_dir, npz),
-                    os.path.join(lp.eye_pcd_dir, npz),
-                    *(os.path.join(c, jpg) for c in cam_dirs),
-                ]
-                for fp in paths:
-                    if os.path.exists(fp):
-                        os.remove(fp)
-                        removed += 1
-            return removed
-
-        if episode_uri.startswith("s3://"):
-            eid = f"{episode_info['device_id']}-{episode_info['session_num']}-{episode_info['segment_num']}-{fs}-{fe}"
-            with filelock.FileLock(str(self.locks_dir / f"{eid}.lock")):
-                return _delete()
-        return _delete()
-
-
-class EgoEpisode(Dataset):
-    """A pure data-reading representation of a single episode interval."""
-
-    LEFT_FRONT_WH = (1920, 1080)
-    RIGHT_FRONT_WH = (1920, 1080)
-    LEFT_EYE_WH = (1920, 1080)
-    RIGHT_EYE_WH = (1920, 1080)
-
-    def __init__(
-        self,
-        rectified_data_dir: str,
-        start_frame: int,
-        end_frame: int,
-        active_cameras: List[str],
-        caption: Optional[str] = None,
-    ):
-        self.rectified_data_dir = rectified_data_dir
-        self.path_manager = LocalPathManager(rectified_data_dir)
         self.start_frame = start_frame
-        self.end_frame = end_frame
-        self.active_cameras = active_cameras
-        self.caption = caption
+        self.end_frame = self.total_frames if end_frame is None else end_frame
+        if not (0 <= self.start_frame < self.end_frame <= self.total_frames):
+            raise ValueError(
+                f"Invalid frame range [{self.start_frame}, {self.end_frame}) for a recording with {self.total_frames} frames."
+            )
 
-        stereo_npz = np.load(self.path_manager.stereo_params_npz, allow_pickle=True)
-        self.stereo_params = {key: stereo_npz[key] for key in stereo_npz.files}
+        self._video_readers: Dict[str, _VideoReader] = {}
+        self._pose_cleaning_metrics: Optional[dict] = None
 
-        with open(self.path_manager.timestamp_txt, "r") as f:
-            self.timestamps = f.read().strip().split("\n")
+    # ---- lazy resources -------------------------------------------------------
 
-        traj_data = np.loadtxt(self.path_manager.slam_trajectory_txt, comments="#")
-        if traj_data.ndim == 1:
-            traj_data = traj_data[None, :]
-        self.c2w_timestamps = (traj_data[:, 0] * 1e9).astype(np.int64)
-        unrect_c2w_poses = traj_data[:, 1:]
+    def _reader(self, camera: str) -> _VideoReader:
+        if camera not in self._video_readers:
+            self._video_readers[camera] = _VideoReader(self.path_manager.video_file(camera))
+        return self._video_readers[camera]
 
-        R1 = np.asarray(self.stereo_params["front_R1"])
-        R_unrect_from_rect = R.from_matrix(R1.T)
-        rot_unrect = R.from_quat(unrect_c2w_poses[:, 3:])
-        rot_rect = rot_unrect * R_unrect_from_rect
-        t_rect = unrect_c2w_poses[:, :3]
-        q_rect = rot_rect.as_quat()
-        self.c2w_poses = np.concatenate([t_rect, q_rect], axis=1)
+    @property
+    def fps(self) -> float:
+        cam = self.active_cameras[0] if self.active_cameras else HAND_CAMS[0]
+        try:
+            return self._reader(cam).fps or 30.0
+        except (FileNotFoundError, IOError):
+            return 30.0
 
-    def _load_hand_streams(self, global_frame: int):
-        filepath = os.path.join(self.path_manager.hand_pose_dir, f"frame_{global_frame:06d}.npz")
+    @property
+    def pose_cleaning_metrics(self) -> dict:
+        """Per-frame cleaning diagnostics, keyed 'frame_{i:06d}' -> {'left': {...}, 'right': {...}}."""
+        if self._pose_cleaning_metrics is None:
+            if os.path.exists(self.path_manager.pose_cleaning_json):
+                with open(self.path_manager.pose_cleaning_json, "r") as f:
+                    self._pose_cleaning_metrics = json.load(f)
+            else:
+                self._pose_cleaning_metrics = {}
+        return self._pose_cleaning_metrics
+
+    def close(self):
+        for reader in self._video_readers.values():
+            reader.release()
+        self._video_readers.clear()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+
+    def __getstate__(self):
+        """Drop process-local resources so episodes pickle cleanly.
+
+        Open decoder handles cannot cross process boundaries; a pickled copy
+        (e.g. in a spawned visualization or DataLoader worker) starts with no
+        readers and lazily reopens its own on first frame access, seeking once
+        if that access is non-sequential. The cached pose-cleaning metrics are
+        dropped too and reload from disk on demand.
+        """
+        state = self.__dict__.copy()
+        state["_video_readers"] = {}
+        state["_pose_cleaning_metrics"] = None
+        return state
+
+    # ---- frame loading ---------------------------------------------------------
+
+    def _load_hands(self, frame_idx: int) -> Dict[str, Optional[HandPose]]:
+        hands: Dict[str, Optional[HandPose]] = {side: None for side in SIDES}
+        filepath = self.path_manager.param_file(frame_idx)
         if not os.path.exists(filepath):
-            return None, None, None, None
+            return hands
 
-        with np.load(filepath, allow_pickle=True) as hand_pose_data:
-            left_data = hand_pose_data["left"].item()
-            right_data = hand_pose_data["right"].item()
-            l_view = left_data.get("front", {}) or {}
-            r_view = right_data.get("front", {}) or {}
-            l_front = l_view.get("keypoints_3d_rectcam")
-            r_front = r_view.get("keypoints_3d_rectcam")
-            # Wrist poses: prefer the materialized/interpolated key (cached in the
-            # front view by _merge_wrist_poses); else parse the fitted root pose
-            # (R_world_hand / t_world_hand) from the top-level hand dict.
-            l_cached = l_view.get("wrist_pose_rectcam")
-            r_cached = r_view.get("wrist_pose_rectcam")
-            l_wrist = (
-                np.asarray(l_cached, dtype=np.float64) if l_cached is not None else _parse_wrist_pose_from_hand(left_data)
-            )
-            r_wrist = (
-                np.asarray(r_cached, dtype=np.float64) if r_cached is not None else _parse_wrist_pose_from_hand(right_data)
-            )
-
-        def is_missing(kp):
-            return kp is None or np.size(kp) == 0 or np.all(kp == 0)
-
-        # Wrist poses are stored/interpolated as 4x4 internally; expose them as 7D
-        # [tx,ty,tz,qx,qy,qz,qw] to match the c2w layout (returns None if missing).
-        return (
-            None if is_missing(l_front) else l_front,
-            None if is_missing(r_front) else r_front,
-            _mat4x4_to_pos_quat(l_wrist),
-            _mat4x4_to_pos_quat(r_wrist),
-        )
-
-    def _load_depth_stream(self, global_frame: int, cam_name: str) -> Optional[np.ndarray]:
-        pcd_dir = self.path_manager.front_pcd_dir if cam_name == "left-front" else self.path_manager.eye_pcd_dir
-        pcd_path = os.path.join(pcd_dir, f"frame_{global_frame:06d}.npz")
-        if os.path.exists(pcd_path):
-            with np.load(pcd_path) as pcd_data:
-                return pcd_data["z"]
-        return None
+        with np.load(filepath, allow_pickle=True) as d:
+            sides = [str(s) for s in d["sides"]]
+            for row, side in enumerate(sides):
+                if side not in SIDES:
+                    continue
+                pose = HandPose(
+                    side=side,
+                    keypoints3d=np.asarray(d["keypoints3d"][row], dtype=np.float32),
+                    vertices=np.asarray(d["vertices"][row], dtype=np.float32),
+                    global_orient=np.asarray(d["global_orients"][row], dtype=np.float32),
+                    transl=np.asarray(d["transls"][row], dtype=np.float32),
+                    hand_pose=np.asarray(d["hand_poses"][row], dtype=np.float32),
+                    betas=np.asarray(d["betas"][row], dtype=np.float32),
+                    source_view=str(d["source_views"][row]),
+                    inlier_mask=np.asarray(d["inlier_masks"][row], dtype=bool),
+                    is_detected=bool(d["is_detected"][row]),
+                    reason=str(d["reasons"][row]),
+                    hand_frame_idx=int(d["hand_frame_idxs"][row]),
+                )
+                if self.valid_only and not pose.is_detected:
+                    continue
+                hands[side] = pose
+        return hands
 
     def __len__(self):
         return self.end_frame - self.start_frame
 
-    def __getitem__(self, idx) -> Union[FrameData, List[FrameData]]:
+    def __getitem__(self, idx) -> Union[HandFrameData, List[HandFrameData]]:
         if isinstance(idx, slice):
             return [self.__getitem__(i) for i in range(*idx.indices(len(self)))]
+        if idx < 0:
+            idx += len(self)
+        if not (0 <= idx < len(self)):
+            raise IndexError(f"Index {idx} out of range for episode of length {len(self)}")
 
-        global_frame = self.start_frame + idx
-        timestamp_ns = int(self.timestamps[global_frame])
+        frame_idx = self.start_frame + idx
 
-        imgs = {cam: None for cam in self.active_cameras}
+        imgs = {cam: None for cam in HAND_CAMS}
         for cam in self.active_cameras:
-            img_path = os.path.join(self.rectified_data_dir, cam, f"frame_{global_frame:06d}.jpg")
-            frame_bgr = cv2.imread(img_path)
-            if frame_bgr is None:
-                raise FileNotFoundError(f"Missing image frame: {img_path}")
-            imgs[cam] = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+            imgs[cam] = self._reader(cam).read_rgb(frame_idx)
 
-        l_front, r_front, l_wrist, r_wrist = self._load_hand_streams(global_frame)
-        left_front_depth = self._load_depth_stream(global_frame, "left-front")
-        left_eye_depth = self._load_depth_stream(global_frame, "left-eye")
+        hands = self._load_hands(frame_idx)
 
-        closest_idx = np.abs(self.c2w_timestamps - timestamp_ns).argmin()
-        c2w = self.c2w_poses[closest_idx]
-
-        return FrameData(
-            timestamp_ns=timestamp_ns,
-            left_front_rgb=imgs.get("left-front"),
-            right_front_rgb=imgs.get("right-front"),
-            left_eye_rgb=imgs.get("left-eye"),
-            right_eye_rgb=imgs.get("right-eye"),
-            left_hand_kp=l_front,
-            right_hand_kp=r_front,
-            left_front_depth=left_front_depth,
-            left_eye_depth=left_eye_depth,
-            c2w=c2w,
-            left_wrist=l_wrist,
-            right_wrist=r_wrist,
+        return HandFrameData(
+            frame_idx=frame_idx,
+            left_front_rgb=imgs["left_front"],
+            right_front_rgb=imgs["right_front"],
+            left_eye_rgb=imgs["left_eye"],
+            right_eye_rgb=imgs["right_eye"],
+            left_hand=hands["left"],
+            right_hand=hands["right"],
         )
 
+    # ---- convenience -----------------------------------------------------------
 
-class EgoDataset(Dataset):
-    """
-    Main Dataset entry point.
-    Maps indices to cached episodes using the CacheManager.
-    """
+    @classmethod
+    def from_s3(
+        cls,
+        session_uri: str,
+        segment: int = 0,
+        target_dir: str = GROUNDED_DIR_DEFAULT,
+        aws_profile: Optional[str] = None,
+        **episode_kwargs,
+    ) -> "HandEpisode":
+        """Download (if needed) then open a segment's hand tracking outputs."""
+        active_cameras = episode_kwargs.get("active_cameras") or list(HAND_CAMS)
+        local_session_dir = download_hand_segment(
+            session_uri,
+            segment,
+            target_dir=target_dir,
+            aws_profile=aws_profile,
+            active_cameras=active_cameras,
+        )
+        return cls(local_session_dir, segment=segment, **episode_kwargs)
 
-    CAMS = ["left-front", "right-front", "left-eye", "right-eye"]
+    @classmethod
+    def from_asset_download(
+        cls,
+        download: "AssetDownload",
+        *,
+        segment: int,
+        active_cameras: Optional[List[str]] = None,
+        valid_only: bool = False,
+    ) -> "HandEpisode":
+        """Open the full Hand segment returned by ``ProcessingClient.download_asset``."""
+
+        files = getattr(download, "files", None)
+        if files is None:
+            raise TypeError("download must be an AssetDownload returned by ProcessingClient.download_asset")
+        hand_files = [
+            item
+            for item in files
+            if str(getattr(item, "lane", "")).lower() == "hand"
+            and Path(str(getattr(item, "local_path", ""))).name == HAND_TAR_NAME_DEFAULT
+        ]
+        if len(hand_files) != 1:
+            raise ValueError(
+                f"AssetDownload must contain exactly one Hand archive named {HAND_TAR_NAME_DEFAULT}, found {len(hand_files)}"
+            )
+        archive_path = Path(str(getattr(hand_files[0], "local_path", ""))).expanduser().resolve()
+        requested_cameras = list(HAND_CAMS if active_cameras is None else active_cameras)
+        if len(set(requested_cameras)) != len(requested_cameras) or not set(requested_cameras).issubset(HAND_CAMS):
+            raise ValueError(f"active_cameras must contain unique names from {HAND_CAMS}")
+
+        download_root = Path(str(getattr(download, "root_dir", "") or archive_path.parent)).expanduser().resolve()
+        session_dir = _extract_full_hand_archive(
+            archive_path,
+            cache_root=download_root,
+            segment=segment,
+            active_cameras=requested_cameras,
+        )
+        episode = cls(
+            str(session_dir),
+            segment=segment,
+            active_cameras=requested_cameras,
+            valid_only=valid_only,
+        )
+        episode.asset_id = str(getattr(download, "asset_id", "") or "")
+        episode.episode_id = ""
+        episode.caption = None
+        episode.lane_status = "available"
+        episode.lane_message = ""
+        episode.run_id = str(getattr(hand_files[0], "run_id", "") or "")
+        episode.job_id = ""
+        episode.download_root = str(download_root)
+        return episode
+
+    def project_to_camera(self, points_3d: np.ndarray, camera: str) -> np.ndarray:
+        """Project (N, 3) points from the unrectified left-front frame into a camera's pixels.
+
+        Returns (N, 2) float pixel coordinates (u, v) for the requested
+        (undistorted pinhole) camera stream.
+        """
+        assert camera in HAND_CAMS, f"camera must be one of {HAND_CAMS}"
+        K = self.camera_params[f"K_{camera}"]
+        T = self.camera_params[f"T_{camera}_from_left_front"]
+        pts = np.asarray(points_3d, dtype=np.float64)
+        pts_h = np.concatenate([pts, np.ones((pts.shape[0], 1))], axis=-1)
+        pts_cam = (T @ pts_h.T).T[:, :3]
+        uvw = (K @ pts_cam.T).T
+        z = uvw[:, 2:3].copy()
+        z[np.abs(z) < 1e-9] = 1e-9
+        return uvw[:, :2] / z
+
+
+class ClippedHandEpisode(HandEpisode):
+    """Open the flat hand lane returned by :meth:`ProcessingClient.download_episode`.
+
+    The clipped videos are indexed from zero, while ``pose_frames.tar`` keeps
+    the immutable source-frame filenames. This reader maps episode-local video
+    frame ``i`` to source pose frame ``source_frame_start + i`` and otherwise
+    implements the same interface as :class:`HandEpisode`, so it can be passed
+    directly to the existing hand visualizers.
+
+    Typical usage::
+
+        record = client.get_episode(episode_id)
+        download = client.download_episode(episode_id, lane="hand")
+        episode = ClippedHandEpisode.from_download(download, caption=record.caption)
+        visualize_hand_episode_to_mp4(episode, "hands.mp4", caption=episode.caption)
+    """
 
     def __init__(
         self,
-        index_path: str,
-        captions_path: Optional[str] = None,
+        lane_dir: Union[str, os.PathLike],
         active_cameras: Optional[List[str]] = None,
-        aws_profile: Optional[str] = None,
-        target_dir: str = GROUNDED_DIR_DEFAULT,
-        min_duration_sec: float = 1.0,
-        fps: float = 30.0,
+        valid_only: bool = False,
+        caption: Optional[str] = None,
     ):
-        self.index_path = Path(index_path).expanduser()
-        self.active_cameras = active_cameras
-        assert set(active_cameras).issubset(set(self.CAMS)) and len(active_cameras) > 0, (
-            f"active_cameras must be one of {self.CAMS}"
+        self.lane_dir = str(Path(lane_dir).expanduser().resolve())
+        lane_path = Path(self.lane_dir)
+        if not lane_path.is_dir():
+            raise FileNotFoundError(f"Clipped hand lane directory does not exist: {lane_path}")
+
+        self.clip_manifest_path = str(lane_path / "clip_manifest.json")
+        try:
+            with open(self.clip_manifest_path, "r") as stream:
+                self.clip_manifest: dict = json.load(stream)
+        except FileNotFoundError as error:
+            raise FileNotFoundError(f"Missing clipped hand manifest: {self.clip_manifest_path}") from error
+        if self.clip_manifest.get("schema_version") != CLIPPED_HAND_SCHEMA_VERSION:
+            raise ValueError(
+                f"Unsupported clipped hand schema {self.clip_manifest.get('schema_version')!r}; "
+                f"expected {CLIPPED_HAND_SCHEMA_VERSION!r}"
+            )
+
+        interval = self.clip_manifest.get("interval")
+        poses = self.clip_manifest.get("poses")
+        videos = self.clip_manifest.get("videos")
+        if not isinstance(interval, dict) or not isinstance(poses, dict) or not isinstance(videos, dict):
+            raise ValueError("Clipped hand manifest must publish interval, poses, and videos objects")
+        declared_camera_files, declared_sidecars = _clipped_manifest_declarations(self.clip_manifest)
+        self.declared_camera_files = tuple(declared_camera_files)
+        self.declared_source_sidecars = tuple(declared_sidecars)
+        declared_lane_files = [*declared_camera_files, *declared_sidecars]
+        missing_declared_files = sorted(name for name in declared_lane_files if not (lane_path / name).is_file())
+        if missing_declared_files:
+            raise FileNotFoundError(
+                "Clipped hand lane is missing manifest-declared file(s): " + ", ".join(missing_declared_files)
+            )
+
+        def manifest_int(section: dict, field: str, *, field_name: Optional[str] = None) -> int:
+            value = section.get(field)
+            if not isinstance(value, int) or isinstance(value, bool):
+                raise ValueError(f"Clipped hand manifest field must be an integer: {field_name or field}")
+            return value
+
+        interval_frame_start = manifest_int(interval, "frame_start")
+        interval_frame_end = manifest_int(interval, "frame_end")
+        self.source_frame_start = manifest_int(poses, "source_frame_start")
+        self.source_frame_end = manifest_int(poses, "source_frame_end")
+        local_frame_start = manifest_int(poses, "episode_local_frame_start")
+        local_frame_end = manifest_int(poses, "episode_local_frame_end")
+        pose_file_count = manifest_int(poses, "pose_file_count")
+
+        if (interval_frame_start, interval_frame_end) != (self.source_frame_start, self.source_frame_end):
+            raise ValueError("Clipped hand interval and pose source-frame bounds do not match")
+        self.total_frames = self.source_frame_end - self.source_frame_start
+        if self.source_frame_start < 0 or self.total_frames <= 0:
+            raise ValueError(f"Invalid clipped hand source-frame range [{self.source_frame_start}, {self.source_frame_end})")
+        if (local_frame_start, local_frame_end) != (0, self.total_frames):
+            raise ValueError(
+                "Clipped hand pose mapping must cover episode-local frames "
+                f"[0, {self.total_frames}), got [{local_frame_start}, {local_frame_end})"
+            )
+        if pose_file_count != self.total_frames:
+            raise ValueError(f"Clipped hand manifest publishes {pose_file_count} pose files for {self.total_frames} frames")
+        if poses.get("pose_file_names_preserve_source_frame_indices") is not True:
+            raise ValueError("Clipped hand pose filenames must preserve source-frame indices")
+
+        for video_name, metadata in videos.items():
+            if not isinstance(metadata, dict):
+                raise ValueError(f"Clipped hand video metadata must be an object: {video_name}")
+            output_frame_count = manifest_int(
+                metadata,
+                "output_frame_count",
+                field_name=f"videos.{video_name}.output_frame_count",
+            )
+            if output_frame_count != self.total_frames:
+                raise ValueError(
+                    f"Clipped hand video {video_name!r} has {output_frame_count} frames; expected {self.total_frames}"
+                )
+
+        pose_archive_path = lane_path / CLIPPED_POSE_TAR_NAME
+        params_dir = _extract_clipped_pose_frames(
+            pose_archive_path,
+            source_frame_start=self.source_frame_start,
+            source_frame_end=self.source_frame_end,
         )
+        self.pose_archive_path = str(pose_archive_path)
+        self.pose_cache_dir = str(params_dir.parent.parent.parent)
+        self.path_manager = ClippedHandPathManager(lane_path, params_dir, self.source_frame_start)
 
-        self.cache_manager = CacheManager(
-            target_dir=target_dir,
-            aws_profile=aws_profile,
-            active_cameras=self.active_cameras,
+        available_cameras = [camera for camera in HAND_CAMS if f"{camera}.mp4" in self.declared_camera_files]
+        self.active_cameras = list(available_cameras if active_cameras is None else active_cameras)
+        if len(set(self.active_cameras)) != len(self.active_cameras) or not set(self.active_cameras).issubset(HAND_CAMS):
+            raise ValueError(f"active_cameras must contain unique names from {HAND_CAMS}")
+        missing_cameras = [camera for camera in self.active_cameras if camera not in available_cameras]
+        if missing_cameras:
+            raise FileNotFoundError(f"Clipped hand lane is missing requested camera video(s): {', '.join(missing_cameras)}")
+
+        if not Path(self.path_manager.camera_params_npz).is_file():
+            raise FileNotFoundError(f"Missing clipped hand camera parameters: {self.path_manager.camera_params_npz}")
+        with np.load(self.path_manager.camera_params_npz, allow_pickle=True) as camera_params:
+            self.camera_params: Dict[str, np.ndarray] = {key: np.asarray(camera_params[key]) for key in camera_params.files}
+
+        self.source_yield_stats = (
+            self._load_optional_json(Path(self.path_manager.yield_json))
+            if "source_yield.json" in self.declared_source_sidecars
+            else {}
         )
+        self.source_continuous_intervals = (
+            self._load_optional_json(Path(self.path_manager.continuous_intervals_json))
+            if "source_continuous_intervals.json" in self.declared_source_sidecars
+            else {}
+        )
+        # These inherited attributes describe the clipped view, not the full source recording.
+        self.yield_stats = {"total_frames": self.total_frames}
+        self.continuous_intervals = self._localize_source_intervals(self.source_continuous_intervals.get("both_intervals", []))
+        self.session_dir = self.lane_dir
+        self.segment = 0
+        self.start_frame = 0
+        self.end_frame = self.total_frames
+        self.valid_only = valid_only
+        self.episode_id = str(self.clip_manifest.get("episode_id") or "")
+        self.asset_id = str(self.clip_manifest.get("asset_id") or "")
+        self.start_ns = manifest_int(interval, "start_ns")
+        self.end_ns = manifest_int(interval, "end_ns")
+        self.caption = caption
+        self.lane_status = ""
+        self.lane_message = ""
+        self.run_id = ""
+        self.job_id = ""
+        self.download_root = ""
+        self._video_readers: Dict[str, _VideoReader] = {}
+        self._pose_cleaning_metrics: Optional[dict] = None
 
-        if not self.index_path.exists():
-            raise FileNotFoundError(f"Index file not found: {self.index_path}")
+    @staticmethod
+    def _load_optional_json(path: Path) -> dict:
+        if not path.is_file():
+            return {}
+        with path.open("r") as stream:
+            value = json.load(stream)
+        if not isinstance(value, dict):
+            raise ValueError(f"Expected a JSON object in clipped hand sidecar: {path}")
+        return value
 
-        with open(self.index_path, "r") as f:
-            raw_data = json.load(f)
+    @property
+    def pose_cleaning_metrics(self) -> dict:
+        """Load clip metrics only when the exact manifest declared the sidecar."""
 
-        self.metadata = raw_data.get("metadata", {})
-        raw_index = list(raw_data.get("index", {}).values())
-        dataset_fps = self.metadata.get("fps", fps)
+        if self._pose_cleaning_metrics is None:
+            if "source_pose_cleaning_metrics.json" in self.declared_source_sidecars:
+                self._pose_cleaning_metrics = self._load_optional_json(Path(self.path_manager.pose_cleaning_json))
+            else:
+                self._pose_cleaning_metrics = {}
+        return self._pose_cleaning_metrics
 
-        self.captions_map = {}
-        if captions_path and Path(captions_path).expanduser().exists():
-            with open(Path(captions_path).expanduser(), "r") as f:
-                for line in f:
-                    if line.strip():
-                        self.captions_map.update(json.loads(line))
+    def _localize_source_intervals(self, intervals: object) -> List[dict]:
+        """Clip inclusive source intervals to this episode and rebase them to local video frames."""
 
-        self.index = []
-        for episode in raw_index:
-            duration_sec = (episode["frame_end"] - episode["frame_start"]) / dataset_fps
-            if duration_sec >= min_duration_sec:
-                self.index.append(episode)
+        if not isinstance(intervals, list):
+            raise ValueError("source_continuous_intervals.json interval fields must be lists")
+        localized: List[dict] = []
+        for interval in intervals:
+            if not isinstance(interval, dict):
+                raise ValueError("source_continuous_intervals.json interval entries must be objects")
+            source_start = interval.get("start")
+            source_end = interval.get("end")
+            if (
+                not isinstance(source_start, int)
+                or isinstance(source_start, bool)
+                or not isinstance(source_end, int)
+                or isinstance(source_end, bool)
+            ):
+                raise ValueError("source_continuous_intervals.json bounds must be integers")
+            clipped_start = max(source_start, self.source_frame_start)
+            clipped_end = min(source_end, self.source_frame_end - 1)
+            if clipped_end < clipped_start:
+                continue
+            localized.append(
+                {
+                    "start": clipped_start - self.source_frame_start,
+                    "end": clipped_end - self.source_frame_start,
+                    "n_present": clipped_end - clipped_start + 1,
+                    "holes": [],
+                    "source_start": clipped_start,
+                    "source_end": clipped_end,
+                }
+            )
+        return localized
 
-        self.unique_uris = [episode["perception_uri"] for episode in self.index]
-        print(f"Loaded dataset index with {len(self.index)} episodes.")
+    @classmethod
+    def from_download(
+        cls,
+        download: "EpisodeDownload",
+        *,
+        active_cameras: Optional[List[str]] = None,
+        valid_only: bool = False,
+        caption: Optional[str] = None,
+    ) -> "ClippedHandEpisode":
+        """Open the exact hand files returned by ``ProcessingClient.download_episode``.
 
-    def download(self, max_workers: int = 4):
-        """Optional helper tool for downloading the dataset upfront."""
-        print(f"Starting parallel cache population with {max_workers} workers...")
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            futures = {
-                executor.submit(self.cache_manager.download_episode, self.index[idx], self.unique_uris[idx]): idx
-                for idx in range(len(self.index))
-            }
-            for future in tqdm(as_completed(futures), total=len(futures), desc="Populating Cache"):
+        ``available`` and ``partial`` hand lanes are accepted when all files
+        needed by the reader are present. Unprocessed or failed lanes produce
+        a clear error and never synthesize placeholder data.
+        """
+
+        lanes = getattr(download, "lanes", None)
+        if lanes is None:
+            raise TypeError("download must be an EpisodeDownload returned by ProcessingClient.download_episode")
+        hand_lanes = [lane for lane in lanes if str(getattr(lane, "lane", "")).lower() == "hand"]
+        if len(hand_lanes) != 1:
+            raise ValueError(f"EpisodeDownload must contain exactly one hand lane, found {len(hand_lanes)}")
+        hand_lane = hand_lanes[0]
+        lane_status = str(getattr(hand_lane, "status", "")).lower()
+        lane_message = str(getattr(hand_lane, "message", "") or "")
+        if lane_status not in {"available", "partial"}:
+            detail = f": {lane_message}" if lane_message else ""
+            raise ValueError(f"Episode hand lane is {lane_status or 'unknown'}{detail}")
+
+        paths_by_name: Dict[str, Path] = {}
+        for downloaded_file in getattr(hand_lane, "files", ()):
+            raw_local_path = str(getattr(downloaded_file, "local_path", "") or "").strip()
+            if not raw_local_path:
+                raise ValueError("Downloaded hand file has no local path")
+            local_path = Path(raw_local_path).expanduser().resolve()
+            if local_path.name in paths_by_name:
+                raise ValueError(f"Downloaded hand lane has duplicate filename: {local_path.name}")
+            paths_by_name[local_path.name] = local_path
+
+        required_names = {"clip_manifest.json", CLIPPED_POSE_TAR_NAME}
+        missing_names = sorted(required_names - paths_by_name.keys())
+        if missing_names:
+            raise FileNotFoundError(f"Downloaded hand lane is missing required file(s): {', '.join(missing_names)}")
+        lane_path = paths_by_name["clip_manifest.json"].parent
+        non_flat = sorted(name for name, path in paths_by_name.items() if path.parent != lane_path)
+        if non_flat:
+            raise ValueError(
+                "Downloaded clipped hand files must share one flat lane directory; misplaced file(s): " + ", ".join(non_flat)
+            )
+        missing_local_files = sorted(name for name, path in paths_by_name.items() if not path.is_file())
+        if missing_local_files:
+            raise FileNotFoundError("EpisodeDownload hand file(s) no longer exist locally: " + ", ".join(missing_local_files))
+
+        with paths_by_name["clip_manifest.json"].open("r") as stream:
+            clip_manifest = json.load(stream)
+        declared_camera_files, declared_sidecars = _clipped_manifest_declarations(clip_manifest)
+        required_names |= set(declared_camera_files) | set(declared_sidecars)
+        missing_declared_downloads = sorted(required_names - paths_by_name.keys())
+        if missing_declared_downloads:
+            raise FileNotFoundError(
+                "EpisodeDownload is missing clipped-hand manifest declaration(s): " + ", ".join(missing_declared_downloads)
+            )
+        expected_episode_id = str(getattr(download, "episode_id", "") or "")
+        expected_asset_id = str(getattr(download, "asset_id", "") or "")
+        if str(clip_manifest.get("episode_id") or "") != expected_episode_id:
+            raise ValueError("Downloaded hand clip manifest episode_id does not match EpisodeDownload")
+        if str(clip_manifest.get("asset_id") or "") != expected_asset_id:
+            raise ValueError("Downloaded hand clip manifest asset_id does not match EpisodeDownload")
+        interval = clip_manifest.get("interval") or {}
+        if (interval.get("start_ns"), interval.get("end_ns")) != (
+            getattr(download, "start_ns", None),
+            getattr(download, "end_ns", None),
+        ):
+            raise ValueError("Downloaded hand clip manifest bounds do not match EpisodeDownload")
+
+        requested_cameras = list(active_cameras or [])
+        if len(set(requested_cameras)) != len(requested_cameras) or not set(requested_cameras).issubset(HAND_CAMS):
+            raise ValueError(f"active_cameras must contain unique names from {HAND_CAMS}")
+        requested_camera_names = [f"{camera}.mp4" for camera in requested_cameras]
+        undeclared_requested = sorted(name for name in requested_camera_names if name not in declared_camera_files)
+        if undeclared_requested:
+            raise FileNotFoundError(
+                "Clipped hand manifest does not declare requested camera video(s): " + ", ".join(undeclared_requested)
+            )
+        missing_requested = sorted(name for name in requested_camera_names if name not in paths_by_name)
+        if missing_requested:
+            raise FileNotFoundError(
+                f"Downloaded hand lane is missing requested camera video(s): {', '.join(missing_requested)}"
+            )
+
+        episode = cls(
+            lane_path,
+            active_cameras=active_cameras,
+            valid_only=valid_only,
+            caption=caption,
+        )
+        consumed_names = required_names | {f"{camera}.mp4" for camera in episode.active_cameras}
+        missing_consumed = sorted(consumed_names - paths_by_name.keys())
+        if missing_consumed:
+            episode.close()
+            raise FileNotFoundError(
+                "Clipped hand reader would use files not present in this EpisodeDownload: " + ", ".join(missing_consumed)
+            )
+        episode.lane_status = lane_status
+        episode.lane_message = lane_message
+        episode.run_id = str(getattr(hand_lane, "run_id", "") or "")
+        episode.job_id = str(getattr(hand_lane, "job_id", "") or "")
+        episode.download_root = str(getattr(download, "root_dir", "") or "")
+        return episode
+
+    def source_frame_index(self, episode_local_frame: int) -> int:
+        """Map an episode-local video index to the immutable source pose index."""
+
+        if not isinstance(episode_local_frame, int) or isinstance(episode_local_frame, bool):
+            raise TypeError("episode_local_frame must be an integer")
+        if not 0 <= episode_local_frame < self.total_frames:
+            raise IndexError(f"Episode-local frame {episode_local_frame} is outside [0, {self.total_frames})")
+        return self.source_frame_start + episode_local_frame
+
+    def episode_local_frame_index(self, source_frame: int) -> int:
+        """Map an immutable source pose index back to the clipped video index."""
+
+        if not isinstance(source_frame, int) or isinstance(source_frame, bool):
+            raise TypeError("source_frame must be an integer")
+        if not self.source_frame_start <= source_frame < self.source_frame_end:
+            raise IndexError(f"Source frame {source_frame} is outside [{self.source_frame_start}, {self.source_frame_end})")
+        return source_frame - self.source_frame_start
+
+
+# =============================================================================
+# Episode manifest
+# =============================================================================
+
+
+class HandManifest:
+    """An episode-level index over one or more sessions' hand tracking segments.
+
+    Wraps a manifest JSON produced by the manifest-creation post-process
+    (candidate hand intervals chopped into discrete captioned episodes by a
+    VLM, non-work spans discarded). Entries are plain dicts with ``key``,
+    ``session``, ``segment``, ``frame_start``/``frame_end`` (end
+    **exclusive**), ``duration_s``, ``source_interval`` and ``activity``;
+    captions are loaded into :attr:`captions` from ``captions_path`` (default:
+    ``{manifest stem}.captions.jsonl`` next to the manifest).
+
+    Each entry's session folder is resolved under ``sessions_root`` (default:
+    the manifest's own directory), falling back to the root itself for a
+    manifest that lives inside its single session folder.
+
+    Usage::
+
+        manifest = HandManifest("manifest.json", sessions_root="downloads")
+        entry = manifest[3]  # by index, or manifest[entry_key]
+        with manifest.open(3, active_cameras=["left_front"]) as episode:
+            print(episode.caption)  # attached from the captions JSONL
+            frame = episode[0]
+    """
+
+    def __init__(
+        self,
+        manifest_path: Union[str, os.PathLike],
+        sessions_root: Optional[str] = None,
+        captions_path: Optional[Union[str, os.PathLike]] = None,
+    ):
+        self.manifest_path = Path(manifest_path).expanduser().resolve()
+        with open(self.manifest_path, "r") as f:
+            self.meta: dict = json.load(f)
+        if not isinstance(self.meta.get("episodes"), list):
+            raise ValueError(f"{self.manifest_path} is not an episode manifest (no 'episodes' list)")
+
+        self.episodes: List[dict] = list(self.meta["episodes"])
+        self._by_key: Dict[str, int] = {e["key"]: i for i, e in enumerate(self.episodes)}
+        self._root = Path(sessions_root).expanduser() if sessions_root else self.manifest_path.parent
+        self._session_dirs: Dict[str, str] = {}
+        self.captions_path = (
+            Path(captions_path).expanduser()
+            if captions_path
+            else self.manifest_path.with_name(self.manifest_path.stem + ".captions.jsonl")
+        )
+        self.captions: Dict[str, str] = self._load_captions()
+
+    def session_dir(self, session: str) -> str:
+        """Resolves (and caches) the folder holding a session's segments."""
+        if session not in self._session_dirs:
+            for cand in (self._root / session, self._root):
+                if cand.is_dir() and any(cand.glob("processed-segment*")):
+                    self._session_dirs[session] = str(cand)
+                    break
+            else:
+                raise FileNotFoundError(
+                    f"Could not locate session {session!r} under {self._root}; pass sessions_root= explicitly."
+                )
+        return self._session_dirs[session]
+
+    def _load_captions(self) -> Dict[str, str]:
+        captions: Dict[str, str] = {}
+        if not self.captions_path.exists():
+            return captions
+        with open(self.captions_path, "r") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
                 try:
-                    future.result()
-                except Exception as exc:
-                    print(f"Download exception: {exc}")
+                    captions.update(json.loads(line))
+                except json.JSONDecodeError:
+                    continue
+        return captions
 
-    def get_caption(self, idx: int) -> Optional[str]:
-        if not self.captions_map:
-            return
+    # ---- entry access ----------------------------------------------------------
 
-        ep = self.index[idx]
-        key = (
-            f"{ep['device_id']}_session_{ep['session_num']}"
-            f"_segment_{ep['segment_num']}_interval_"
-            f"{ep['frame_start']}_{ep['frame_end']}"
+    def __len__(self) -> int:
+        return len(self.episodes)
+
+    def __iter__(self):
+        return iter(self.episodes)
+
+    def __getitem__(self, episode: Union[int, str]) -> dict:
+        if isinstance(episode, str):
+            if episode not in self._by_key:
+                raise KeyError(f"No episode {episode!r} in {self.manifest_path}")
+            return self.episodes[self._by_key[episode]]
+        return self.episodes[episode]
+
+    def caption(self, episode: Union[int, str]) -> Optional[str]:
+        return self.captions.get(self[episode]["key"])
+
+    # ---- episode loading ---------------------------------------------------------
+
+    def open(self, episode: Union[int, str], **episode_kwargs) -> HandEpisode:
+        """Opens one manifest entry as a :class:`HandEpisode` restricted to the
+        entry's ``[frame_start, frame_end)`` range.
+
+        Keyword args are forwarded to ``HandEpisode`` (``active_cameras``,
+        ``valid_only``, ...). The entry and its caption ride along as
+        ``episode.manifest_entry`` and ``episode.caption``.
+        """
+        entry = self[episode]
+        ep = HandEpisode(
+            self.session_dir(entry["session"]),
+            segment=int(entry["segment"]),
+            start_frame=int(entry["frame_start"]),
+            end_frame=int(entry["frame_end"]),
+            **episode_kwargs,
         )
-        return self.captions_map.get(key)
-
-    def __len__(self):
-        return len(self.index)
-
-    def delete_episode(self, idx: int, purge_segment: bool = False) -> int:
-        """Delete episode `idx`'s cached files (see CacheManager.delete_episode).
-        purge_segment=True frees more but wipes sibling episodes from the same
-        segment; safe only in one-pass jobs. Returns file count removed."""
-        return self.cache_manager.delete_episode(self.index[idx], self.unique_uris[idx], purge_segment=purge_segment)
-
-    def __getitem__(self, idx) -> Union[EgoEpisode, List[EgoEpisode]]:
-        if isinstance(idx, slice):
-            return [self.__getitem__(i) for i in range(*idx.indices(len(self)))]
-        if isinstance(idx, (list, tuple, np.ndarray)):
-            return [self.__getitem__(int(i)) for i in idx]
-
-        episode_info = self.index[idx]
-        episode_uri = self.unique_uris[idx]
-        local_rectified_dir = self.cache_manager.download_episode(episode_info, episode_uri)
-
-        return EgoEpisode(
-            rectified_data_dir=local_rectified_dir,
-            start_frame=episode_info["frame_start"],
-            end_frame=episode_info["frame_end"],
-            active_cameras=self.active_cameras,
-            caption=self.get_caption(idx),
-        )
+        ep.manifest_entry = entry
+        ep.caption = self.captions.get(entry["key"])
+        return ep
