@@ -16,57 +16,68 @@
 ```
 
 ## setup
-First download `conda` or your preferred Python environment manager.
+
+Grounded requires Python 3.10 or newer. Install it from a source checkout:
 
 ```bash
-conda create -n grounded python=3.10
-conda activate grounded
+python -m pip install .
+# or
 python -m pip install git+https://github.com/grounded-superintelligence/grounded.git
 ```
 
 ## usage
-You should be given an `index.json`, `captions.jsonl`, and `credentials` that corresponds your proprietary dataset. Add the contents of `credentials` to your `~/.aws/credentials` file. Below is a basic snippet of the basic modules present in `grounded` SDK:
 
-```python
-from grounded.data.ego_dataset import EgoDataset, EgoEpisode
-from grounded.data.visualize import visualize_episode_to_mp4
-from grounded.data.visualize_3d import visualize_episode_to_rerun
+A delivery includes a JSON manifest plus access to the exact files it
+references. No API server is required.
 
-INDEX_JSON = "index.json"  # change this to your path
-CAPTIONS_JSONL = "captions.jsonl"  # change this to your path
-EPISODE_IDX = 0
+The quickest validation uses the existing Python demo:
 
-# load dataset & episode
-dataset = EgoDataset(
-    index_path=INDEX_JSON,
-    captions_path=CAPTIONS_JSONL,
-    active_cameras=["left-front", "right-front"],
-    target_dir="~/.cache/grounded/data",
-    min_duration_sec=4,
-)
-episode = dataset[EPISODE_IDX]
-
-os.makedirs("outputs/", exist_ok=True)
-
-# print caption
-print(dataset.get_caption(EPISODE_IDX))
-# print(dataset[EPISODE_IDX].caption)  # alternate way to get caption, but will download all episode files
-
-# generate mp4 render
-visualize_episode_to_mp4(
-    episode=episode,
-    output_path=f"outputs/sdkvis{EPISODE_IDX}.mp4",
-    downsample=4,
-    fps=30,
-    max_workers=16,
-    max_depth=5,
-)
-
-# generate rerun 3d
-visualize_episode_to_rerun(
-    episode=episode,
-    output_path=f"outputs/sdkvis{EPISODE_IDX}.rrd",
-)
+```bash
+python demo.py --manifest /path/to/manifest.json --episode 0
 ```
 
-Refer to `docs/DATA.md` for the exact specifications of all parameters used in this library.
+Both commands download every available enrichment lane, report unavailable or
+partial lanes, and write an MP4 (camera grid with hand skeletons) and a Rerun
+`.rrd` file (world-frame when the SLAM lane is available) under `outputs/`.
+Downloads are cached under `~/.cache/grounded/data`.
+
+Numeric episode indexes follow the row order in the supplied manifest.
+
+If a legacy manifest does not include SHA-256 checksums, add
+`--allow-missing-sha256`. New manifests should include checksums.
+
+### manifest access
+
+The SDK supports two delivery options:
+
+- A manifest containing presigned HTTPS URLs works without AWS credentials.
+  The URLs stop working at their stated expiration time.
+- A manifest containing `s3://` URIs uses the normal AWS credential chain.
+  Pass `--aws-profile PROFILE` to the demo when using a named local profile.
+
+Credentials are never stored in the manifest or packaged in the SDK.
+
+The same flow can be used directly from Python:
+
+```python
+# see demo.py for reference
+from grounded.data.processing import ProcessingClient
+from grounded.data.visualize_hand import visualize_hand_episode_to_mp4
+
+client = ProcessingClient.from_manifest("manifest.json")
+record = client.list_episodes()[0]
+
+episode = client.open_hand(record.episode_id, active_cameras=["left_front"])
+try:
+    visualize_hand_episode_to_mp4(
+        episode,
+        "episode.mp4",
+        caption=episode.caption,
+    )
+finally:
+    episode.close()
+```
+
+See [`docs/ASSET_EPISODE_FLOW.md`](docs/ASSET_EPISODE_FLOW.md) for the complete
+asset and episode control flow, and [`docs/DATA.md`](docs/DATA.md) for the
+exact specification of every array the readers expose.
