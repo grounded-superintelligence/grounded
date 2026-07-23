@@ -17,12 +17,24 @@
 
 ## setup
 
+Install the API and manifest client from a source checkout:
+
 ```bash
 git clone https://github.com/grounded-superintelligence/grounded.git
 cd grounded
 git checkout v1.0.0
 python -m pip install -e .
 ```
+
+Install the visualization dependencies when rendering MP4 or Rerun files:
+
+```bash
+python -m pip install -e ".[visualization]"
+```
+
+The prepared PyPI distribution name is `grounded-sdk`. After its first public
+release, the equivalent commands will be `python -m pip install grounded-sdk`
+and `python -m pip install "grounded-sdk[visualization]"`.
 
 ## usage
 
@@ -53,9 +65,33 @@ lanes, and renders Hand tracking to MP4 and Rerun `.rrd` files under `outputs/`.
 Downloads are cached under `~/.cache/grounded/data`.
 
 Presigned manifests require no AWS credentials. Manifests containing `s3://`
-URIs use the normal AWS credential chain; pass `--aws-profile PROFILE` when
-using a named profile. Add `--allow-missing-sha256` only for legacy manifests
-without checksums.
+URIs require the `s3` or `visualization` extra and use the normal AWS credential
+chain; pass `--aws-profile PROFILE` when using a named profile. Add
+`--allow-missing-sha256` only for legacy manifests without checksums.
+
+The same client can connect to a hosted API:
+
+```python
+import os
+
+from grounded.processing import ProcessingClient
+
+client = ProcessingClient.from_api(
+    os.environ["GROUNDED_API_URL"],
+    bearer_token=os.environ["GROUNDED_API_TOKEN"],
+)
+
+assets = client.list_assets(lane="hand", status="available")
+asset = client.get_asset(assets.assets[0].asset_id)
+download = client.download_asset(asset.asset_id)
+
+episode = client.get_episode("ep_v1_...")
+hand_only = client.download_episode(episode.episode_id, lane="hand")
+```
+
+The API or manifest supplies exact files and reports each lane as available,
+partial, not processed, or failed. Storage credentials are never packaged in
+the SDK.
 
 ### v0
 You should be given an `index.json` and `captions.jsonl` for your proprietary
