@@ -57,6 +57,8 @@ Both commands download every available enrichment lane, report unavailable or
 partial lanes, and write an MP4 and Rerun `.rrd` file under `outputs/`. Downloads
 are cached under `~/.cache/grounded/data`.
 
+Numeric episode indexes follow the row order in the supplied manifest.
+
 If a legacy manifest does not include SHA-256 checksums, add
 `--allow-missing-sha256`. New manifests should include checksums.
 

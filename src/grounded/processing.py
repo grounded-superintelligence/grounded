@@ -650,6 +650,7 @@ class JsonEpisodeResolver:
             raise ProcessingError("episode contract field must be a list: episodes")
 
         self._episodes: dict[str, EpisodeRecord] = {}
+        self._episode_order: list[str] = []
         for raw_episode in raw_episodes:
             if not isinstance(raw_episode, Mapping):
                 raise ProcessingError("episode contract entries must be objects")
@@ -657,6 +658,7 @@ class JsonEpisodeResolver:
             if episode.episode_id in self._episodes:
                 raise ProcessingError(f"duplicate episode_id in episode contract: {episode.episode_id}")
             self._episodes[episode.episode_id] = episode
+            self._episode_order.append(episode.episode_id)
 
     def episode(self, episode_id: str) -> EpisodeRecord:
         try:
@@ -665,7 +667,7 @@ class JsonEpisodeResolver:
             raise EpisodeNotFoundError(f"episode not found: {episode_id}") from exc
 
     def episodes(self) -> list[EpisodeRecord]:
-        return [self._episodes[key] for key in sorted(self._episodes)]
+        return [self._episodes[key] for key in self._episode_order]
 
 
 class HttpAssetResolver:

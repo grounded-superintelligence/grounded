@@ -58,7 +58,7 @@ python demo_v1.py \
 The demo downloads every available Hand, SLAM, and depth lane before rendering
 Hand. Unavailable lanes are reported without placeholder files. It writes an
 MP4 and Rerun `.rrd` file under `outputs/`, and reuses downloads cached under
-`~/.cache/grounded/data`.
+`~/.cache/grounded/data`. Numeric episode indexes follow manifest row order.
 
 For a presigned manifest, no AWS credentials are required. For a manifest with
 `s3://` file URIs, use the normal AWS credential chain or pass

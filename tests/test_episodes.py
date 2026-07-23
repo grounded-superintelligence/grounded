@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import hashlib
 import io
 import json
@@ -15,6 +16,7 @@ from grounded.processing import (
     JsonEpisodeResolver,
     ProcessingClient,
     ProcessingError,
+    _expected_episode_id,
 )
 
 
@@ -124,6 +126,34 @@ def test_processing_client_from_manifest_lists_episodes(tmp_path: Path) -> None:
 
     assert len(episodes) == 1
     assert episodes[0].asset_id == "ast_v1_example"
+
+
+def test_processing_client_preserves_manifest_episode_order(tmp_path: Path) -> None:
+    contract, _ = _episode_contract()
+    first = contract.pop("episode")
+    second = copy.deepcopy(first)
+    first["asset_id"] = "ast_v1_first_row"
+    first["episode_id"] = _expected_episode_id(
+        asset_id=first["asset_id"],
+        start_ns=first["interval"]["start_ns"],
+        end_ns=first["interval"]["end_ns"],
+    )
+    second["asset_id"] = "ast_v1_second_row"
+    second["episode_id"] = _expected_episode_id(
+        asset_id=second["asset_id"],
+        start_ns=second["interval"]["start_ns"],
+        end_ns=second["interval"]["end_ns"],
+    )
+    contract["episodes"] = [first, second]
+    path = tmp_path / "manifest.json"
+    path.write_text(json.dumps(contract), encoding="utf-8")
+
+    client = ProcessingClient.from_manifest(path)
+
+    assert [episode.episode_id for episode in client.list_episodes()] == [
+        first["episode_id"],
+        second["episode_id"],
+    ]
 
 
 def test_open_hand_dispatches_to_episode_reader_for_episode_manifest(monkeypatch: pytest.MonkeyPatch) -> None:
