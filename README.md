@@ -78,24 +78,6 @@ finally:
     episode.close()
 ```
 
-To download every published enrichment for a full segment from an asset
-manifest:
-
-```python
-client = ProcessingClient.from_manifest("assets.json")
-download = client.download_asset("ast_v1_...")
-
-# Or download selected lanes only.
-hand = client.download_asset("ast_v1_...", lanes=["hand"])
-
-# Open and visualize the full Hand segment.
-episode = client.open_hand("ast_v1_...", active_cameras=["left_front"])
-```
-
-`ProcessingClient.from_api(...)` is available if Grounded later provides an
-HTTP API URL. It is not required for manifest-based delivery. Storage access is
-granted separately and is never embedded in the SDK.
-
 See [`docs/ASSET_EPISODE_FLOW.md`](docs/ASSET_EPISODE_FLOW.md) for the complete
 asset and episode control flow, and [`docs/DATA.md`](docs/DATA.md) for the
 exact specification of every array the readers expose.
