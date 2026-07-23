@@ -131,6 +131,15 @@ def test_json_asset_resolver_accepts_resolved_public_lane_states_without_fake_li
     )
 
 
+def test_json_asset_resolver_does_not_require_internal_source_uri() -> None:
+    contract = _public_asset_contract()
+    contract["asset"].pop("source_uri")
+
+    resolved = JsonAssetResolver(contract, strict=True).asset("asset-segment-2")
+
+    assert resolved.source_uri == ""
+
+
 def test_json_asset_resolver_rejects_files_for_unavailable_lane_state() -> None:
     contract, _ = _downloadable_asset_contract()
     contract["asset"]["artifacts"][0]["status"] = "not_processed"
