@@ -16,7 +16,7 @@
 ```
 
 <p align="center">
-  <img src="docs/assets/demo.gif" alt="World-frame Rerun visualization of MANO hand meshes alongside the camera view">
+  <img src="docs/assets/demo.gif" alt="World-frame Rerun visualization of MANO hand meshes alongside the camera view" width="100%">
 </p>
 
 ## setup
