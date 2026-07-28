@@ -11,7 +11,7 @@ from pathlib import Path
 
 from grounded.data.ego_dataset import HAND_CAMS
 from grounded.data.processing import ProcessingClient
-from grounded.data.visualize_hand import visualize_hand_episode_to_mp4
+from grounded.data.visualize_hand import format_caption_for_display, visualize_hand_episode_to_mp4
 from grounded.data.visualize_hand_3d import visualize_hand_episode_to_rerun
 
 
@@ -89,7 +89,7 @@ def main():
     try:
         print(f"Loaded {identifier}: {len(hand)} Hand frame(s)")
         if caption:
-            print(f"Caption: {caption}")
+            print(f"Caption: {format_caption_for_display(caption)}")
         visualize_hand_episode_to_mp4(
             hand,
             str(output_dir / f"{identifier}.mp4"),
