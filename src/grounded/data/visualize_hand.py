@@ -63,6 +63,16 @@ HAND_EDGES = [
 ]
 
 
+def format_caption_for_display(caption: Optional[str]) -> Optional[str]:
+    """Capitalize the first letter for display without changing the source caption."""
+    if not caption:
+        return caption
+    for index, character in enumerate(caption):
+        if character.isalpha():
+            return caption[:index] + character.upper() + caption[index + 1 :]
+    return caption
+
+
 def draw_uv_skeleton(image: np.ndarray, uvs: np.ndarray, inplace: bool = False) -> np.ndarray:
     """Draws the MANO-21 bone edges.
 
@@ -136,6 +146,7 @@ def _append_caption_bar(img_bgr: np.ndarray, caption: str) -> np.ndarray:
     The bar height depends only on the caption and frame width, so every frame
     of an episode keeps identical dimensions.
     """
+    caption = format_caption_for_display(caption) or ""
     w = img_bgr.shape[1]
     scale = max(0.4, w / 1600.0)
     thickness = max(1, int(round(2 * scale)))
